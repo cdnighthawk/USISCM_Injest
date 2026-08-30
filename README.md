@@ -30,6 +30,12 @@ pip install -e ".[pdf]"
 
 Copy `.env.example` to `.env` and set `USISCM_EMAIL` / `USISCM_PASSWORD`.
 
+On this server, Autodesk Desktop Connector already downloads ACC projects to:
+
+`C:\Users\CharlesDossett\DC\ACCDocs`
+
+That path is the default watch directory. Ingest never moves files out of ACCDocs (doing so would look like a delete to Desktop Connector). Status manifests are written under `C:\Users\CharlesDossett\DC\USISCM-ingest`.
+
 ## Classify a package
 
 Works on a zip **or** an already-extracted folder:
@@ -59,17 +65,25 @@ Uploads:
 - CAD drawings → `POST /api/documents/projects/{id}/bulk`
 - Specs, bid instructions, addenda, reports, schedules, other → `POST /api/documents/projects/{id}/documents/bulk-docs` with a category
 
-## Watch a drop folder on the server
+## Watch ACCDocs on this server
 
-Point this at the directory your office copies packages into:
+Desktop Connector lays projects out as `ACCDocs\<hub>\<project>\...`. The watcher treats each ACC project folder as a package:
 
-```bash
-export USISCM_WATCH_DIR=/data/estimate-drops
-usiscm-ingest watch --once          # process what is there now
-usiscm-ingest watch                 # poll until stopped
+```bat
+usiscm-ingest watch --once
+usiscm-ingest watch
 ```
 
-Finished packages move to `processed/` (or `USISCM_PROCESSED_DIR`). Failures move to `failed/`. A JSON manifest is written next to each moved package.
+Defaults (override in `.env` if needed):
+
+| Variable | Default |
+| --- | --- |
+| `USISCM_WATCH_DIR` | `C:\Users\CharlesDossett\DC\ACCDocs` |
+| `USISCM_PROCESSED_DIR` | `C:\Users\CharlesDossett\DC\USISCM-ingest\processed` |
+| `USISCM_FAILED_DIR` | `C:\Users\CharlesDossett\DC\USISCM-ingest\failed` |
+| `USISCM_LEAVE_IN_PLACE` | `true` |
+
+Already-ingested projects are skipped until you pass `--reprocess`. Use `--move` only for a throwaway zip drop folder that is **not** ACCDocs.
 
 ## Optional hint file
 

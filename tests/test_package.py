@@ -5,8 +5,8 @@ from pathlib import Path
 
 from usiscm_ingest.classify import FileCategory
 from usiscm_ingest.cli import main
-from usiscm_ingest.client import _best_project_match
-from usiscm_ingest.package import ingest_source, package_label
+from usiscm_ingest.client import UploadResult, _best_project_match
+from usiscm_ingest.package import ingest_source, iter_packages, package_label, package_state_key
 
 
 def _write(path: Path, data: bytes = b"x") -> None:
@@ -96,6 +96,65 @@ def test_classify_cli_writes_manifest(tmp_path: Path, capsys) -> None:
     assert payload["counts"]["drawing"] == 1
     printed = capsys.readouterr().out
     assert "drawing" in printed
+
+
+def test_iter_packages_expands_acc_hub_layout(tmp_path: Path) -> None:
+    hub = tmp_path / "USIS Account"
+    project = hub / "Kaiser Permanente San Rafael"
+    _write(project / "Project Files" / "A-101.pdf")
+    other = tmp_path / "Sutter Health Oakland MOB"
+    _write(other / "A-201.pdf")
+    zip_path = tmp_path / "extra.zip"
+    zip_path.write_bytes(b"PK\x03\x04")
+
+    packages = {path.name for path in iter_packages(tmp_path)}
+    assert packages == {"Kaiser Permanente San Rafael", "Sutter Health Oakland MOB", "extra.zip"}
+    assert "USIS Account" not in packages
+
+
+def test_acc_state_key_uses_hub_and_project(tmp_path: Path) -> None:
+    project = tmp_path / "Hub" / "Job"
+    project.mkdir(parents=True)
+    assert package_state_key(tmp_path, project) == "Hub__Job"
+
+
+def test_watch_leave_in_place_writes_sidecar_and_skips_second_pass(tmp_path: Path, monkeypatch) -> None:
+    accdocs = tmp_path / "ACCDocs"
+    project = accdocs / "Account" / "Kaiser MOB"
+    _write(project / "Drawings" / "A-101.pdf")
+    state = tmp_path / "USISCM-ingest"
+    monkeypatch.setenv("USISCM_WATCH_DIR", str(accdocs))
+    monkeypatch.setenv("USISCM_PROCESSED_DIR", str(state / "processed"))
+    monkeypatch.setenv("USISCM_FAILED_DIR", str(state / "failed"))
+    monkeypatch.setenv("USISCM_EMAIL", "user@example.com")
+    monkeypatch.setenv("USISCM_PASSWORD", "secret")
+
+    class FakeClient:
+        calls = 0
+
+        def import_package(self, manifest, project_id=None, dry_run=False):
+            FakeClient.calls += 1
+            return UploadResult(project_id=project_id or 1, imported=len(manifest.files))
+
+    monkeypatch.setattr("usiscm_ingest.cli._client", lambda settings: FakeClient())
+
+    assert main(["watch", "--once"]) == 0
+    assert project.exists()
+    sidecar = state / "processed" / "Account__Kaiser MOB.manifest.json"
+    assert sidecar.is_file()
+    assert FakeClient.calls == 1
+
+    assert main(["watch", "--once"]) == 0
+    assert FakeClient.calls == 1
+    assert project.exists()
+
+
+def test_watch_missing_accdocs_errors(tmp_path: Path, monkeypatch, caplog) -> None:
+    missing = tmp_path / "no-such-accdocs"
+    monkeypatch.setenv("USISCM_WATCH_DIR", str(missing))
+    with caplog.at_level("ERROR"):
+        assert main(["watch", "--once", "--dry-run"]) == 2
+    assert "does not exist" in caplog.text
 
 
 def test_project_match_uses_token_overlap() -> None:

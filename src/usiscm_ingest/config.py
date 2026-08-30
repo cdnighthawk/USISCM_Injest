@@ -12,6 +12,11 @@ from usiscm_ingest.classify import DEFAULT_HINTS, CategoryHints, FileCategory
 
 load_dotenv()
 
+# Autodesk Desktop Connector sync root on this server.
+DEFAULT_WATCH_DIR = Path(r"C:\Users\CharlesDossett\DC\ACCDocs")
+DEFAULT_PROCESSED_DIR = Path(r"C:\Users\CharlesDossett\DC\USISCM-ingest\processed")
+DEFAULT_FAILED_DIR = Path(r"C:\Users\CharlesDossett\DC\USISCM-ingest\failed")
+
 
 @dataclass
 class Settings:
@@ -23,22 +28,34 @@ class Settings:
     processed_dir: Path | None = None
     failed_dir: Path | None = None
     poll_seconds: int = 60
+    leave_in_place: bool = True
+
+
+def _path_env(name: str, default: Path | None = None) -> Path | None:
+    if name not in os.environ:
+        return default
+    raw = os.environ[name].strip()
+    return Path(raw).expanduser() if raw else None
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def load_settings() -> Settings:
-    watch = os.getenv("USISCM_WATCH_DIR", "").strip()
-    work = os.getenv("USISCM_WORK_DIR", "").strip()
-    processed = os.getenv("USISCM_PROCESSED_DIR", "").strip()
-    failed = os.getenv("USISCM_FAILED_DIR", "").strip()
     return Settings(
         base_url=os.getenv("USISCM_BASE_URL", "https://www.usiscm.com").rstrip("/"),
         email=os.getenv("USISCM_EMAIL", "").strip(),
         password=os.getenv("USISCM_PASSWORD", "").strip(),
-        watch_dir=Path(watch).expanduser() if watch else None,
-        work_dir=Path(work).expanduser() if work else None,
-        processed_dir=Path(processed).expanduser() if processed else None,
-        failed_dir=Path(failed).expanduser() if failed else None,
+        watch_dir=_path_env("USISCM_WATCH_DIR", DEFAULT_WATCH_DIR),
+        work_dir=_path_env("USISCM_WORK_DIR"),
+        processed_dir=_path_env("USISCM_PROCESSED_DIR", DEFAULT_PROCESSED_DIR),
+        failed_dir=_path_env("USISCM_FAILED_DIR", DEFAULT_FAILED_DIR),
         poll_seconds=int(os.getenv("USISCM_POLL_SECONDS", "60")),
+        leave_in_place=_bool_env("USISCM_LEAVE_IN_PLACE", True),
     )
 
 

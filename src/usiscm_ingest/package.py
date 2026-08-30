@@ -170,14 +170,52 @@ def ingest_source(
     )
 
 
+_SKIP_DIR_NAMES = {"processed", "failed"}
+
+
+def _visible_children(path: Path) -> list[Path]:
+    return sorted(
+        child
+        for child in path.iterdir()
+        if not child.name.startswith(".") and child.name not in _SKIP_DIR_NAMES
+    )
+
+
+def _looks_like_acc_hub(path: Path) -> bool:
+    """True when a folder is an ACC account/hub (projects nested one level down)."""
+    if not path.is_dir():
+        return False
+    children = _visible_children(path)
+    return bool(children) and all(child.is_dir() for child in children)
+
+
+def package_state_key(drop: Path, package: Path) -> str:
+    """Stable sidecar filename for a package relative to the ACCDocs root."""
+    try:
+        rel = package.resolve().relative_to(drop.resolve())
+    except ValueError:
+        rel = Path(package.name)
+    return "__".join(rel.parts) or package.name
+
+
 def iter_packages(source_dir: Path) -> list[Path]:
-    """Immediate zips and subfolders in a drop directory (not recursive)."""
+    """Zips and project folders under a drop directory.
+
+    Autodesk Desktop Connector lays ACC out as ``ACCDocs/<hub>/<project>/...``.
+    Those hub folders are expanded so each ACC project is imported separately.
+    A flat drop of zips or estimate folders still works the same as before.
+    """
     source_dir = source_dir.expanduser().resolve()
     packages: list[Path] = []
-    for path in sorted(source_dir.iterdir()):
-        if path.name.startswith("."):
+    for path in _visible_children(source_dir):
+        if path.suffix.lower() == ".zip" and path.is_file():
+            packages.append(path)
             continue
-        if path.is_dir() or path.suffix.lower() == ".zip":
+        if not path.is_dir():
+            continue
+        if _looks_like_acc_hub(path):
+            packages.extend(child for child in _visible_children(path) if child.is_dir())
+        else:
             packages.append(path)
     return packages
 

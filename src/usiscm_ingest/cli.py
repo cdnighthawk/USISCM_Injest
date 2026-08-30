@@ -12,7 +12,7 @@ from pathlib import Path
 
 from usiscm_ingest.client import UsiscmClient, UsiscmError
 from usiscm_ingest.config import load_settings
-from usiscm_ingest.package import ingest_source, iter_packages, stamp_name
+from usiscm_ingest.package import ingest_source, iter_packages, package_state_key, stamp_name
 
 logger = logging.getLogger("usiscm_ingest")
 
@@ -44,13 +44,28 @@ def main(argv: list[str] | None = None) -> int:
     import_cmd.add_argument("--work-dir", type=Path)
     import_cmd.add_argument("--json", dest="json_out", type=Path)
 
-    watch = sub.add_parser("watch", help="Poll a drop folder on this server and import new packages")
-    watch.add_argument("directory", nargs="?", type=Path, help="Drop folder (default: USISCM_WATCH_DIR)")
+    watch = sub.add_parser("watch", help="Poll ACCDocs (or another drop folder) and import new packages")
+    watch.add_argument(
+        "directory",
+        nargs="?",
+        type=Path,
+        help="Drop folder (default: USISCM_WATCH_DIR or C:\\Users\\CharlesDossett\\DC\\ACCDocs)",
+    )
     watch.add_argument("--project-id", type=int, help="Force every package onto one project")
     watch.add_argument("--interval", type=int, help="Seconds between scans")
     watch.add_argument("--once", action="store_true", help="Process current packages and exit")
     watch.add_argument("--peek-pdf", action="store_true")
     watch.add_argument("--dry-run", action="store_true")
+    watch.add_argument(
+        "--move",
+        action="store_true",
+        help="Move packages out of the drop folder after ingest (do not use on ACCDocs)",
+    )
+    watch.add_argument(
+        "--reprocess",
+        action="store_true",
+        help="Import packages even if a sidecar manifest already exists",
+    )
 
     args = parser.parse_args(argv)
     logging.basicConfig(
@@ -104,19 +119,32 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     if drop is None:
         logger.error("Pass a drop folder or set USISCM_WATCH_DIR")
         return 2
-    drop = Path(drop).expanduser().resolve()
-    drop.mkdir(parents=True, exist_ok=True)
-    processed = settings.processed_dir or drop / "processed"
-    failed = settings.failed_dir or drop / "failed"
+    drop = Path(drop).expanduser()
+    if not drop.exists():
+        logger.error("Drop folder does not exist: %s", drop)
+        return 2
+    drop = drop.resolve()
+    processed = (settings.processed_dir or drop / "processed").expanduser()
+    failed = (settings.failed_dir or drop / "failed").expanduser()
     processed.mkdir(parents=True, exist_ok=True)
     failed.mkdir(parents=True, exist_ok=True)
     interval = args.interval or settings.poll_seconds
+    leave_in_place = settings.leave_in_place and not args.move
     client = None if args.dry_run else _client(settings)
+
+    def sidecar(dest_root: Path, package: Path) -> Path:
+        return dest_root / f"{package_state_key(drop, package)}.manifest.json"
+
+    def already_handled(package: Path) -> bool:
+        if args.reprocess:
+            return False
+        return sidecar(processed, package).exists() or sidecar(failed, package).exists()
 
     def run_once() -> int:
         status = 0
         for package in iter_packages(drop):
-            if package.name in {"processed", "failed"}:
+            if already_handled(package):
+                logger.debug("Skipping already ingested %s", package)
                 continue
             logger.info("Processing %s", package)
             manifest = ingest_source(package, work_dir=settings.work_dir, peek_pdf=args.peek_pdf)
@@ -136,16 +164,26 @@ def _cmd_watch(args: argparse.Namespace) -> int:
                         if result.errors:
                             dest_root = failed
                             status = 1
-                dest = dest_root / stamp_name(package)
-                if dest.exists():
-                    dest = dest_root / f"{stamp_name(package)}_{id(package)}"
-                shutil.move(str(package), str(dest))
-                manifest.write_json(dest.with_suffix(dest.suffix + ".manifest.json") if dest.is_file() else dest / "manifest.json")
+                if args.dry_run:
+                    pass
+                elif leave_in_place:
+                    manifest.write_json(sidecar(dest_root, package))
+                else:
+                    dest = dest_root / stamp_name(package)
+                    if dest.exists():
+                        dest = dest_root / f"{stamp_name(package)}_{id(package)}"
+                    shutil.move(str(package), str(dest))
+                    manifest.write_json(
+                        dest.with_suffix(dest.suffix + ".manifest.json") if dest.is_file() else dest / "manifest.json"
+                    )
             except (UsiscmError, OSError) as exc:
                 logger.error("Failed %s: %s", package, exc)
                 status = 1
                 try:
-                    shutil.move(str(package), str(failed / stamp_name(package)))
+                    if leave_in_place:
+                        sidecar(failed, package).write_text(json.dumps({"error": str(exc)}), encoding="utf-8")
+                    else:
+                        shutil.move(str(package), str(failed / stamp_name(package)))
                 except OSError:
                     pass
         return status
