@@ -13,6 +13,7 @@ from pathlib import Path
 from usiscm_ingest.client import UsiscmClient, UsiscmError
 from usiscm_ingest.config import load_settings
 from usiscm_ingest.package import ingest_source, iter_packages, package_state_key, stamp_name
+from usiscm_ingest.state import PackageState, pending_manifest, scan_changes, seed_from_legacy_manifest
 
 logger = logging.getLogger("usiscm_ingest")
 
@@ -64,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
     watch.add_argument(
         "--reprocess",
         action="store_true",
-        help="Import packages even if a sidecar manifest already exists",
+        help="Re-import every file, even if it has not changed",
     )
 
     args = parser.parse_args(argv)
@@ -132,58 +133,82 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     leave_in_place = settings.leave_in_place and not args.move
     client = None if args.dry_run else _client(settings)
 
-    def sidecar(dest_root: Path, package: Path) -> Path:
-        return dest_root / f"{package_state_key(drop, package)}.manifest.json"
-
-    def already_handled(package: Path) -> bool:
-        if args.reprocess:
-            return False
-        return sidecar(processed, package).exists() or sidecar(failed, package).exists()
+    def state_path(package: Path) -> Path:
+        return processed / f"{package_state_key(drop, package)}.state.json"
 
     def run_once() -> int:
         status = 0
         for package in iter_packages(drop):
-            if already_handled(package):
-                logger.debug("Skipping already ingested %s", package)
-                continue
-            logger.info("Processing %s", package)
+            logger.info("Scanning %s", package)
             manifest = ingest_source(package, work_dir=settings.work_dir, peek_pdf=args.peek_pdf)
-            _print_manifest(manifest)
-            dest_root = failed if manifest.errors else processed
+            if manifest.errors:
+                _print_manifest(manifest)
+                status = 1
+                continue
+            state = PackageState.load(state_path(package), source=str(package), label=manifest.label)
+            seed_from_legacy_manifest(
+                state,
+                manifest,
+                processed / f"{package_state_key(drop, package)}.manifest.json",
+            )
+            scan = scan_changes(
+                manifest,
+                state,
+                reprocess=args.reprocess,
+                settle_seconds=0 if args.reprocess else settings.settle_seconds,
+            )
+            if scan.settling:
+                logger.info("Waiting on %d file(s) still being copied in %s", scan.settling, package.name)
+            if not scan.pending:
+                logger.info(
+                    "No new or changed files in %s (%d unchanged)",
+                    package.name,
+                    scan.unchanged,
+                )
+                if not args.dry_run:
+                    state.save()
+                continue
+            pending = pending_manifest(manifest, scan.pending)
+            logger.info(
+                "Ingesting %d change(s) in %s: %s",
+                len(scan.pending),
+                package.name,
+                ", ".join(f"{delta.reason}:{delta.item.relative_path}" for delta in scan.pending[:20]),
+            )
+            _print_manifest(pending)
             try:
-                if not manifest.errors:
-                    if client is None:
-                        logger.info("Dry run — not uploading %s", package.name)
-                    else:
-                        result = client.import_package(
-                            manifest,
-                            project_id=args.project_id,
-                            dry_run=False,
-                        )
-                        print(json.dumps(result.to_dict(), indent=2))
-                        if result.errors:
-                            dest_root = failed
-                            status = 1
-                if args.dry_run:
-                    pass
-                elif leave_in_place:
-                    manifest.write_json(sidecar(dest_root, package))
-                else:
-                    dest = dest_root / stamp_name(package)
+                if client is None:
+                    logger.info("Dry run — not uploading %s", package.name)
+                    continue
+                result = client.import_package(
+                    pending,
+                    project_id=args.project_id,
+                    dry_run=False,
+                )
+                print(json.dumps(result.to_dict(), indent=2))
+                if result.errors:
+                    state.mark_failed(scan.pending, error=json.dumps(result.errors))
+                    state.save()
+                    status = 1
+                    continue
+                state.mark_imported(scan.pending, project_id=result.project_id)
+                state.save()
+                if not leave_in_place:
+                    dest = processed / stamp_name(package)
                     if dest.exists():
-                        dest = dest_root / f"{stamp_name(package)}_{id(package)}"
+                        dest = processed / f"{stamp_name(package)}_{id(package)}"
                     shutil.move(str(package), str(dest))
-                    manifest.write_json(
+                    pending.write_json(
                         dest.with_suffix(dest.suffix + ".manifest.json") if dest.is_file() else dest / "manifest.json"
                     )
             except (UsiscmError, OSError) as exc:
                 logger.error("Failed %s: %s", package, exc)
                 status = 1
                 try:
-                    if leave_in_place:
-                        sidecar(failed, package).write_text(json.dumps({"error": str(exc)}), encoding="utf-8")
-                    else:
-                        shutil.move(str(package), str(failed / stamp_name(package)))
+                    state.mark_failed(scan.pending, error=str(exc))
+                    state.save()
+                    if not leave_in_place:
+                        shutil.move(str(package), str((settings.failed_dir or drop / "failed") / stamp_name(package)))
                 except OSError:
                     pass
         return status

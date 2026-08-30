@@ -118,7 +118,7 @@ def test_acc_state_key_uses_hub_and_project(tmp_path: Path) -> None:
     assert package_state_key(tmp_path, project) == "Hub__Job"
 
 
-def test_watch_leave_in_place_writes_sidecar_and_skips_second_pass(tmp_path: Path, monkeypatch) -> None:
+def test_watch_ingests_new_addenda_without_reuploading_old_files(tmp_path: Path, monkeypatch) -> None:
     accdocs = tmp_path / "ACCDocs"
     project = accdocs / "Account" / "Kaiser MOB"
     _write(project / "Drawings" / "A-101.pdf")
@@ -126,26 +126,31 @@ def test_watch_leave_in_place_writes_sidecar_and_skips_second_pass(tmp_path: Pat
     monkeypatch.setenv("USISCM_WATCH_DIR", str(accdocs))
     monkeypatch.setenv("USISCM_PROCESSED_DIR", str(state / "processed"))
     monkeypatch.setenv("USISCM_FAILED_DIR", str(state / "failed"))
+    monkeypatch.setenv("USISCM_SETTLE_SECONDS", "0")
     monkeypatch.setenv("USISCM_EMAIL", "user@example.com")
     monkeypatch.setenv("USISCM_PASSWORD", "secret")
 
     class FakeClient:
-        calls = 0
+        calls: list[list[str]] = []
 
         def import_package(self, manifest, project_id=None, dry_run=False):
-            FakeClient.calls += 1
+            names = [item.path.name for item in manifest.files]
+            FakeClient.calls.append(names)
             return UploadResult(project_id=project_id or 1, imported=len(manifest.files))
 
     monkeypatch.setattr("usiscm_ingest.cli._client", lambda settings: FakeClient())
 
     assert main(["watch", "--once"]) == 0
-    assert project.exists()
-    sidecar = state / "processed" / "Account__Kaiser MOB.manifest.json"
+    assert FakeClient.calls == [["A-101.pdf"]]
+    sidecar = state / "processed" / "Account__Kaiser MOB.state.json"
     assert sidecar.is_file()
-    assert FakeClient.calls == 1
 
     assert main(["watch", "--once"]) == 0
-    assert FakeClient.calls == 1
+    assert FakeClient.calls == [["A-101.pdf"]]
+
+    _write(project / "Addenda" / "Addendum 02.pdf", b"addendum-two")
+    assert main(["watch", "--once"]) == 0
+    assert FakeClient.calls == [["A-101.pdf"], ["Addendum 02.pdf"]]
     assert project.exists()
 
 

@@ -28,6 +28,7 @@ class Settings:
     processed_dir: Path | None = None
     failed_dir: Path | None = None
     poll_seconds: int = 60
+    settle_seconds: int = 15
     leave_in_place: bool = True
 
 
@@ -55,6 +56,7 @@ def load_settings() -> Settings:
         processed_dir=_path_env("USISCM_PROCESSED_DIR", DEFAULT_PROCESSED_DIR),
         failed_dir=_path_env("USISCM_FAILED_DIR", DEFAULT_FAILED_DIR),
         poll_seconds=int(os.getenv("USISCM_POLL_SECONDS", "60")),
+        settle_seconds=int(os.getenv("USISCM_SETTLE_SECONDS", "15")),
         leave_in_place=_bool_env("USISCM_LEAVE_IN_PLACE", True),
     )
 

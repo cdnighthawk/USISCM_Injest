@@ -146,13 +146,14 @@ def ingest_source(
             errors=[f"Source must be a .zip or a directory: {source}"],
         )
 
-    # If the archive contains a single top-level folder, classify from there
-    # so relative paths do not include a redundant wrapper directory.
-    children = [p for p in root.iterdir() if not should_skip(p)]
-    if len(children) == 1 and children[0].is_dir():
-        classify_root = children[0]
-    else:
-        classify_root = root
+    classify_root = root
+    # Zip archives often wrap contents in one folder; peel that so relative
+    # paths match the inner set. Live ACC project folders must keep a stable
+    # root or adding Addenda would rewrite every existing path and re-upload.
+    if source.suffix.lower() == ".zip":
+        children = [p for p in root.iterdir() if not should_skip(p)]
+        if len(children) == 1 and children[0].is_dir():
+            classify_root = children[0]
 
     files = classify_files(collect_files(classify_root), root=classify_root, peek_pdf=peek_pdf)
     logger.info(

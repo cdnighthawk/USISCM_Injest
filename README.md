@@ -34,7 +34,7 @@ On this server, Autodesk Desktop Connector already downloads ACC projects to:
 
 `C:\Users\CharlesDossett\DC\ACCDocs`
 
-That path is the default watch directory. Ingest never moves files out of ACCDocs (doing so would look like a delete to Desktop Connector). Status manifests are written under `C:\Users\CharlesDossett\DC\USISCM-ingest`.
+That path is the default watch directory. Ingest never moves files out of ACCDocs (doing so would look like a delete to Desktop Connector). Per-file ingest state is written under `C:\Users\CharlesDossett\DC\USISCM-ingest`.
 
 ## Classify a package
 
@@ -67,12 +67,18 @@ Uploads:
 
 ## Watch ACCDocs on this server
 
-Desktop Connector lays projects out as `ACCDocs\<hub>\<project>\...`. The watcher treats each ACC project folder as a package:
+Desktop Connector lays projects out as `ACCDocs\<hub>\<project>\...`. The watcher treats each ACC project folder as a package and **keeps a per-file fingerprint**, so addenda and other files dropped in later are imported without re-uploading the whole project.
 
 ```bat
 usiscm-ingest watch --once
 usiscm-ingest watch
 ```
+
+Each poll:
+
+1. Waits `USISCM_SETTLE_SECONDS` (default 15) so a file still copying from ACC is not ingested mid-write
+2. Uploads files that are new, have different content, or failed last time
+3. Skips unchanged files (same size and timestamp, or same SHA-256 if Desktop Connector only touched the timestamp)
 
 Defaults (override in `.env` if needed):
 
@@ -81,9 +87,11 @@ Defaults (override in `.env` if needed):
 | `USISCM_WATCH_DIR` | `C:\Users\CharlesDossett\DC\ACCDocs` |
 | `USISCM_PROCESSED_DIR` | `C:\Users\CharlesDossett\DC\USISCM-ingest\processed` |
 | `USISCM_FAILED_DIR` | `C:\Users\CharlesDossett\DC\USISCM-ingest\failed` |
+| `USISCM_POLL_SECONDS` | `60` |
+| `USISCM_SETTLE_SECONDS` | `15` |
 | `USISCM_LEAVE_IN_PLACE` | `true` |
 
-Already-ingested projects are skipped until you pass `--reprocess`. Use `--move` only for a throwaway zip drop folder that is **not** ACCDocs.
+Use `--reprocess` to force every file again. Use `--move` only for a throwaway zip drop folder that is **not** ACCDocs.
 
 ## Optional hint file
 

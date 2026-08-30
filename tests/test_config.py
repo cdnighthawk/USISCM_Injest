@@ -26,11 +26,13 @@ def test_default_watch_dir_is_accdocs(monkeypatch) -> None:
     monkeypatch.delenv("USISCM_PROCESSED_DIR", raising=False)
     monkeypatch.delenv("USISCM_FAILED_DIR", raising=False)
     monkeypatch.delenv("USISCM_LEAVE_IN_PLACE", raising=False)
+    monkeypatch.delenv("USISCM_SETTLE_SECONDS", raising=False)
     settings = load_settings()
     assert settings.watch_dir == DEFAULT_WATCH_DIR
     assert settings.processed_dir == DEFAULT_PROCESSED_DIR
     assert settings.failed_dir == DEFAULT_FAILED_DIR
     assert settings.leave_in_place is True
+    assert settings.settle_seconds == 15
 
 
 def test_empty_watch_dir_env_disables_default(monkeypatch) -> None:
