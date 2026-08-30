@@ -13,9 +13,11 @@ import requests
 from usiscm_ingest.classify import FileCategory
 from usiscm_ingest.config import Settings
 from usiscm_ingest.microsoft import (
+    UNATTENDED_HINT,
     EntraApp,
     MicrosoftAuthError,
     discover_entra_app,
+    load_tokens,
     resolve_access_token,
 )
 from usiscm_ingest.package import PackageManifest
@@ -55,13 +57,22 @@ class UsiscmClient:
         self.timeout = timeout
         self.session = requests.Session()
         self.token: str | None = None
+        self.auth_mode: str | None = None
         self._entra: EntraApp | None = None
+
+    @property
+    def uses_ingest_key(self) -> bool:
+        return bool(self.settings.ingest_api_key)
 
     def entra_app(self) -> EntraApp:
         if self._entra is not None:
             return self._entra
         if self.settings.ms_tenant_id and self.settings.ms_client_id:
             self._entra = EntraApp(self.settings.ms_tenant_id, self.settings.ms_client_id)
+            return self._entra
+        cached = load_tokens(self.settings.token_path)
+        if cached and cached.tenant_id and cached.client_id:
+            self._entra = EntraApp(cached.tenant_id, cached.client_id, cached.scopes)
             return self._entra
         try:
             self._entra = discover_entra_app(self.settings.base_url, timeout=self.timeout)
@@ -70,6 +81,11 @@ class UsiscmClient:
         return self._entra
 
     def login(self, *, interactive: bool = False) -> str:
+        if self.settings.ingest_api_key:
+            self.token = self.settings.ingest_api_key
+            self.auth_mode = "ingest_key"
+            self.session.headers["Authorization"] = f"Bearer {self.token}"
+            return self.token
         try:
             token = resolve_access_token(
                 self.entra_app(),
@@ -80,6 +96,7 @@ class UsiscmClient:
         except MicrosoftAuthError as exc:
             raise UsiscmError(str(exc)) from exc
         self.token = token
+        self.auth_mode = "microsoft"
         self.session.headers["Authorization"] = f"Bearer {token}"
         return token
 
@@ -91,8 +108,16 @@ class UsiscmClient:
             raise UsiscmError(payload.get("error") or f"Auth status failed ({response.status_code})")
         return payload
 
-    def list_projects(self, *, limit: int = 500) -> list[dict[str, Any]]:
+    def list_projects(self, *, limit: int = 500, query: str = "") -> list[dict[str, Any]]:
         self._ensure_auth()
+        if self.uses_ingest_key:
+            params = {"q": query} if query else {}
+            response = self.session.get(self._url("api/projects"), params=params, timeout=self.timeout)
+            payload = _json(response)
+            if not response.ok:
+                raise UsiscmError(payload.get("error") or f"Project list failed ({response.status_code})")
+            return payload.get("projects") or payload.get("items") or []
+
         collected: list[dict[str, Any]] = []
         offset = 0
         while True:
@@ -121,6 +146,12 @@ class UsiscmClient:
     ) -> dict[str, Any]:
         if project_id:
             self._ensure_auth()
+            if self.uses_ingest_key:
+                matches = self.list_projects(query=project_id)
+                for project in matches:
+                    if str(project.get("id") or project.get("project_id")) == str(project_id):
+                        return project
+                raise UsiscmError(f"Project {project_id} not found")
             response = self.session.get(self._url(f"api/v1/projects/{project_id}"), timeout=self.timeout)
             payload = _json(response)
             if not response.ok:
@@ -185,7 +216,11 @@ class UsiscmClient:
             ]
             result.skipped += len(skipped)
             for item in docs:
-                if category == FileCategory.SPEC and item.path.suffix.lower() == ".pdf":
+                if (
+                    category == FileCategory.SPEC
+                    and item.path.suffix.lower() == ".pdf"
+                    and not self.uses_ingest_key
+                ):
                     result.details.append(self._upload_spec_book(resolved_id, item))
                 result.details.append(self._upload_document(resolved_id, item, category, manifest.label))
 
@@ -198,6 +233,27 @@ class UsiscmClient:
 
     def _upload_drawing(self, project_id: str, item, label: str) -> dict[str, Any]:
         self._ensure_auth()
+        if self.uses_ingest_key:
+            metadata = {
+                "project_id": project_id,
+                "filename": item.path.name,
+                "sheet_number": item.sheet_number,
+                "drawing_set": label,
+                "split_pages": item.path.suffix.lower() == ".pdf",
+                "source": "usiscm_ingest",
+                "source_id": item.relative_path,
+            }
+            response = self.session.post(
+                self._url("api/drawings"),
+                files={"file": (item.path.name, item.path.read_bytes())},
+                data={"metadata": json.dumps(metadata), "sourceSystem": "usiscm_ingest"},
+                timeout=max(self.timeout, 180),
+            )
+            payload = _json(response)
+            if not response.ok and response.status_code != 201:
+                return {"endpoint": "ingest/drawings", "filename": item.path.name, "imported": 0, "error": payload.get("error") or response.status_code}
+            return {"endpoint": "ingest/drawings", "filename": item.path.name, "imported": int(payload.get("count") or 1), "errors": []}
+
         data = {
             "drawing_set": label,
             "split_pages": "1" if item.path.suffix.lower() == ".pdf" else "0",
@@ -218,6 +274,8 @@ class UsiscmClient:
 
     def _upload_spec_book(self, project_id: str, item) -> dict[str, Any]:
         self._ensure_auth()
+        if self.uses_ingest_key:
+            return {"endpoint": "ingest/skip-spec-book", "filename": item.path.name, "imported": 0, "errors": []}
         response = self.session.post(
             self._url(f"api/v1/projects/{project_id}/spec-book/import"),
             files={"file": (item.path.name, item.path.read_bytes(), "application/pdf")},
@@ -244,14 +302,10 @@ class UsiscmClient:
             "source_id": item.relative_path,
             "folder_name": label,
         }
-        headers = {}
-        if self.settings.ingest_api_key:
-            headers["Authorization"] = f"Bearer {self.settings.ingest_api_key}"
         response = self.session.post(
             self._url("api/documents"),
             files={"file": (item.path.name, item.path.read_bytes())},
             data={"metadata": json.dumps(metadata), "sourceSystem": "usiscm_ingest"},
-            headers=headers or None,
             timeout=max(self.timeout, 180),
         )
         payload = _json(response)
@@ -273,6 +327,8 @@ class UsiscmClient:
     def _ensure_auth(self) -> None:
         if not self.token:
             self.login(interactive=False)
+            if not self.token:
+                raise UsiscmError(UNATTENDED_HINT)
 
     def _url(self, path: str) -> str:
         return urljoin(self.base_url, path.lstrip("/"))

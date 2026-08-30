@@ -26,6 +26,13 @@ DEFAULT_SCOPES = "openid profile email offline_access User.Read"
 DEFAULT_TOKEN_PATH = Path.home() / ".config" / "usiscm-ingest" / "ms_tokens.json"
 
 
+UNATTENDED_HINT = (
+    "Night jobs cannot wait for Microsoft sign-in. Set USISCM_INGEST_API_KEY "
+    "on the server (recommended), or run `usiscm-ingest login` once during the "
+    "day so a refresh token is saved."
+)
+
+
 class MicrosoftAuthError(RuntimeError):
     pass
 
@@ -48,12 +55,19 @@ class MicrosoftTokens:
     def expired(self) -> bool:
         return time.time() >= (self.expires_at - 120)
 
+    tenant_id: str = ""
+    client_id: str = ""
+    scopes: str = DEFAULT_SCOPES
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "access_token": self.access_token,
             "refresh_token": self.refresh_token,
             "expires_at": self.expires_at,
             "token_type": self.token_type,
+            "tenant_id": self.tenant_id,
+            "client_id": self.client_id,
+            "scopes": self.scopes,
         }
 
     @classmethod
@@ -63,6 +77,9 @@ class MicrosoftTokens:
             refresh_token=str(raw.get("refresh_token") or "") or None,
             expires_at=float(raw.get("expires_at") or 0),
             token_type=str(raw.get("token_type") or "Bearer"),
+            tenant_id=str(raw.get("tenant_id") or ""),
+            client_id=str(raw.get("client_id") or ""),
+            scopes=str(raw.get("scopes") or DEFAULT_SCOPES),
         )
 
 
@@ -144,6 +161,9 @@ def refresh_tokens(app: EntraApp, refresh_token: str, timeout: int = 30) -> Micr
     tokens = tokens_from_endpoint(payload)
     if not tokens.refresh_token:
         tokens.refresh_token = refresh_token
+    tokens.tenant_id = app.tenant_id
+    tokens.client_id = app.client_id
+    tokens.scopes = app.scopes
     return tokens
 
 
@@ -198,7 +218,11 @@ def device_code_login(
         payload = _json(token_res)
         error = str(payload.get("error") or "")
         if token_res.ok and payload.get("access_token"):
-            return tokens_from_endpoint(payload)
+            tokens = tokens_from_endpoint(payload)
+            tokens.tenant_id = app.tenant_id
+            tokens.client_id = app.client_id
+            tokens.scopes = app.scopes
+            return tokens
         if error in {"authorization_pending", "slow_down"}:
             if error == "slow_down":
                 interval += 2
@@ -227,9 +251,17 @@ def resolve_access_token(
         except MicrosoftAuthError as exc:
             logger.warning("Microsoft refresh failed: %s", exc)
     if not interactive:
-        raise MicrosoftAuthError("Not signed in. Run `usiscm-ingest login` (Microsoft).")
+        raise MicrosoftAuthError(UNATTENDED_HINT)
     tokens = device_code_login(app)
+    tokens.tenant_id = app.tenant_id
+    tokens.client_id = app.client_id
+    tokens.scopes = app.scopes
     save_tokens(token_path, tokens)
+    if not tokens.refresh_token:
+        logger.warning(
+            "Microsoft did not return a refresh token. Night jobs will fail after this access token expires. "
+            "Set USISCM_INGEST_API_KEY for unattended runs."
+        )
     return tokens.access_token
 
 

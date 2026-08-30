@@ -37,11 +37,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    login = sub.add_parser("login", help="Sign in with Microsoft (device code)")
+    login = sub.add_parser("login", help="One-time Microsoft sign-in during the day (saves a refresh token)")
     login.add_argument("--access-token", help="Use an existing Microsoft access token instead of device login")
 
     sub.add_parser("logout", help="Forget the saved Microsoft session")
     sub.add_parser("whoami", help="Show the signed-in Microsoft / USISCM user")
+    sub.add_parser("refresh", help="Silently renew a saved Microsoft session (no prompt; for night jobs)")
 
     classify = sub.add_parser("classify", help="Classify a zip or folder without uploading")
     classify.add_argument("source", type=Path, help="Zip file or extracted package folder")
@@ -77,6 +78,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_logout()
     if args.command == "whoami":
         return _cmd_whoami()
+    if args.command == "refresh":
+        return _cmd_refresh()
     if args.command == "classify":
         return _cmd_classify(args)
     if args.command == "import":
@@ -108,6 +111,24 @@ def _cmd_login(args: argparse.Namespace) -> int:
         return 2
     user = (status.get("user") or {})
     print(f"Signed in as {user.get('email') or 'Microsoft user'} (saved {settings.token_path})")
+    print("Night jobs will reuse this session. They will not ask you to sign in.")
+    return 0 if status.get("authenticated") else 1
+
+
+def _cmd_refresh() -> int:
+    settings = load_settings()
+    client = UsiscmClient(settings)
+    try:
+        client.login(interactive=False)
+        if client.uses_ingest_key:
+            print("Using USISCM_INGEST_API_KEY — no Microsoft refresh needed.")
+            return 0
+        status = client.auth_status()
+    except UsiscmError as exc:
+        logger.error("%s", exc)
+        return 2
+    user = status.get("user") or {}
+    print(f"Session renewed for {user.get('email') or 'Microsoft user'}")
     return 0 if status.get("authenticated") else 1
 
 
@@ -119,11 +140,18 @@ def _cmd_logout() -> int:
 
 
 def _cmd_whoami() -> int:
+    settings = load_settings()
+    client = UsiscmClient(settings)
+    if client.uses_ingest_key:
+        print(json.dumps({"authenticated": True, "mode": "ingest_key", "night_jobs": True}, indent=2))
+        return 0
     try:
-        status = UsiscmClient(load_settings()).auth_status()
+        status = client.auth_status()
     except UsiscmError as exc:
         logger.error("%s", exc)
         return 2
+    status["mode"] = "microsoft"
+    status["night_jobs"] = True
     print(json.dumps(status, indent=2))
     return 0 if status.get("authenticated") else 1
 

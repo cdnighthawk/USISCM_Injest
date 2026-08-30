@@ -28,16 +28,39 @@ PDF first-page text is optional and only used with `--peek-pdf`:
 pip install -e ".[pdf]"
 ```
 
-Copy `.env.example` to `.env`. Sign in with **Microsoft** (the same SSO used on [usiscm.com](https://www.usiscm.com)) — there is no email/password login for this script.
+Copy `.env.example` to `.env` on the **server**. Night jobs do not open a Microsoft login.
+
+### Unattended night runs (recommended)
+
+Set `USISCM_INGEST_API_KEY` to the same machine key USISCM already uses for Autodesk ingest (`CM_INGEST_API_KEY` or `CM_API_KEY` on the site). The cron job uses that key. Nobody has to be at a keyboard.
+
+```bash
+# /etc/usiscm-ingest.env
+USISCM_BASE_URL=https://www.usiscm.com
+USISCM_INGEST_API_KEY=...
+USISCM_WATCH_DIR=/data/estimate-drops
+```
+
+```bash
+# 2:15 AM every night — see deploy/usiscm-ingest.cron
+usiscm-ingest watch --once
+```
+
+Or enable the systemd timer in `deploy/usiscm-ingest.timer`.
+
+### Optional: Microsoft session (one daytime login)
+
+If you are not using the ingest API key, run this **once during the day**:
 
 ```bash
 usiscm-ingest login
 ```
 
-That prints a Microsoft device code. Open the URL, sign in with your USIS work account, then the token is stored under `~/.config/usiscm-ingest/ms_tokens.json`. Tenant and client id are read from `/auth/microsoft/start` unless you set `USISCM_MS_TENANT_ID` / `USISCM_MS_CLIENT_ID`.
+That saves a refresh token. Night jobs call `usiscm-ingest refresh` / `watch --once` and never prompt. If Microsoft does not issue a refresh token, use `USISCM_INGEST_API_KEY` instead.
 
 ```bash
 usiscm-ingest whoami
+usiscm-ingest refresh
 usiscm-ingest logout
 ```
 
