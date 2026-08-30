@@ -1,0 +1,4 @@
+# Run after hours. This job never opens a Microsoft login prompt.
+# Put USISCM_INGEST_API_KEY in /etc/usiscm-ingest.env (recommended).
+# 2:15 AM server time, every night:
+15 2 * * *  /usr/bin/env bash -lc 'set -a; source /etc/usiscm-ingest.env; set +a; /opt/usiscm-ingest/.venv/bin/usiscm-ingest watch --once >> /var/log/usiscm-ingest.log 2>&1'
