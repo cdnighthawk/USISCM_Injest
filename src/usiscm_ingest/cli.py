@@ -12,6 +12,13 @@ from pathlib import Path
 
 from usiscm_ingest.client import UsiscmClient, UsiscmError
 from usiscm_ingest.config import load_settings
+from usiscm_ingest.microsoft import (
+    MicrosoftAuthError,
+    MicrosoftTokens,
+    clear_tokens,
+    device_code_login,
+    save_tokens,
+)
 from usiscm_ingest.package import ingest_source, iter_packages, stamp_name
 
 logger = logging.getLogger("usiscm_ingest")
@@ -22,13 +29,19 @@ def main(argv: list[str] | None = None) -> int:
         prog="usiscm-ingest",
         description=(
             "Classify files in an estimate package (zip or folder) and import them "
-            "into USIS Construction Management. Packages are not assumed to follow "
-            "any one GC's naming — files are categorized as drawings, specs, bid "
-            "instructions, addenda, reports, schedules, or other."
+            "into USIS Construction Management. Sign in with Microsoft — the same "
+            "SSO used on usiscm.com — then categorize files as drawings, specs, "
+            "bid instructions, addenda, reports, schedules, or other."
         ),
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    login = sub.add_parser("login", help="Sign in with Microsoft (device code)")
+    login.add_argument("--access-token", help="Use an existing Microsoft access token instead of device login")
+
+    sub.add_parser("logout", help="Forget the saved Microsoft session")
+    sub.add_parser("whoami", help="Show the signed-in Microsoft / USISCM user")
 
     classify = sub.add_parser("classify", help="Classify a zip or folder without uploading")
     classify.add_argument("source", type=Path, help="Zip file or extracted package folder")
@@ -38,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
 
     import_cmd = sub.add_parser("import", help="Classify and upload one package to USISCM")
     import_cmd.add_argument("source", type=Path, help="Zip file or extracted package folder")
-    import_cmd.add_argument("--project-id", type=int, help="USISCM project id (skips name matching)")
+    import_cmd.add_argument("--project-id", help="USISCM project UUID (skips name matching)")
     import_cmd.add_argument("--dry-run", action="store_true", help="Resolve the project and classify only")
     import_cmd.add_argument("--peek-pdf", action="store_true")
     import_cmd.add_argument("--work-dir", type=Path)
@@ -46,7 +59,7 @@ def main(argv: list[str] | None = None) -> int:
 
     watch = sub.add_parser("watch", help="Poll a drop folder on this server and import new packages")
     watch.add_argument("directory", nargs="?", type=Path, help="Drop folder (default: USISCM_WATCH_DIR)")
-    watch.add_argument("--project-id", type=int, help="Force every package onto one project")
+    watch.add_argument("--project-id", help="Force every package onto one project UUID")
     watch.add_argument("--interval", type=int, help="Seconds between scans")
     watch.add_argument("--once", action="store_true", help="Process current packages and exit")
     watch.add_argument("--peek-pdf", action="store_true")
@@ -58,6 +71,12 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
+    if args.command == "login":
+        return _cmd_login(args)
+    if args.command == "logout":
+        return _cmd_logout()
+    if args.command == "whoami":
+        return _cmd_whoami()
     if args.command == "classify":
         return _cmd_classify(args)
     if args.command == "import":
@@ -66,6 +85,47 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_watch(args)
     parser.error(f"Unknown command {args.command}")
     return 2
+
+
+def _cmd_login(args: argparse.Namespace) -> int:
+    settings = load_settings()
+    client = UsiscmClient(settings)
+    try:
+        app = client.entra_app()
+        if args.access_token:
+            save_tokens(settings.token_path, MicrosoftTokens(access_token=args.access_token, expires_at=time.time() + 3600))
+            client.settings.ms_access_token = args.access_token
+            client.login()
+        else:
+            print("Sign in with the same Microsoft account you use on usiscm.com.", flush=True)
+            tokens = device_code_login(app)
+            save_tokens(settings.token_path, tokens)
+            client.token = tokens.access_token
+            client.session.headers["Authorization"] = f"Bearer {tokens.access_token}"
+        status = client.auth_status()
+    except (MicrosoftAuthError, UsiscmError) as exc:
+        logger.error("%s", exc)
+        return 2
+    user = (status.get("user") or {})
+    print(f"Signed in as {user.get('email') or 'Microsoft user'} (saved {settings.token_path})")
+    return 0 if status.get("authenticated") else 1
+
+
+def _cmd_logout() -> int:
+    settings = load_settings()
+    clear_tokens(settings.token_path)
+    print(f"Cleared Microsoft session at {settings.token_path}")
+    return 0
+
+
+def _cmd_whoami() -> int:
+    try:
+        status = UsiscmClient(load_settings()).auth_status()
+    except UsiscmError as exc:
+        logger.error("%s", exc)
+        return 2
+    print(json.dumps(status, indent=2))
+    return 0 if status.get("authenticated") else 1
 
 
 def _cmd_classify(args: argparse.Namespace) -> int:
@@ -84,7 +144,7 @@ def _cmd_import(args: argparse.Namespace) -> int:
     if manifest.errors:
         return 1
     try:
-        result = _client(settings).import_package(
+        result = UsiscmClient(settings).import_package(
             manifest,
             project_id=args.project_id,
             dry_run=args.dry_run,
@@ -111,7 +171,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     processed.mkdir(parents=True, exist_ok=True)
     failed.mkdir(parents=True, exist_ok=True)
     interval = args.interval or settings.poll_seconds
-    client = None if args.dry_run else _client(settings)
+    client = None if args.dry_run else UsiscmClient(settings)
 
     def run_once() -> int:
         status = 0
@@ -157,12 +217,6 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     while True:
         run_once()
         time.sleep(interval)
-
-
-def _client(settings) -> UsiscmClient:
-    if not settings.email or not settings.password:
-        raise SystemExit("Set USISCM_EMAIL and USISCM_PASSWORD (see .env.example)")
-    return UsiscmClient(settings.base_url, settings.email, settings.password)
 
 
 def _print_manifest(manifest) -> None:

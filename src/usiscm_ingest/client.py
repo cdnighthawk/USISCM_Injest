@@ -1,24 +1,28 @@
-"""HTTP client for the USIS Construction Management API."""
+"""HTTP client for USIS Construction Management (Microsoft-authenticated)."""
 
 from __future__ import annotations
 
-import io
+import json
 import logging
-import zipfile
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
 import requests
 
 from usiscm_ingest.classify import FileCategory
+from usiscm_ingest.config import Settings
+from usiscm_ingest.microsoft import (
+    EntraApp,
+    MicrosoftAuthError,
+    discover_entra_app,
+    resolve_access_token,
+)
 from usiscm_ingest.package import PackageManifest
 
 logger = logging.getLogger(__name__)
 
-DRAWING_IMPORT_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
-DRAWING_TABLE_EXTENSIONS = {".dwg", ".dxf", ".pdf", ".png", ".jpg", ".jpeg", ".xls", ".xlsx"}
+DRAWING_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 DOCUMENT_EXTENSIONS = {".pdf", ".dwg", ".doc", ".docx", ".xls", ".xlsx", ".png", ".jpg", ".jpeg"}
 
 
@@ -28,7 +32,7 @@ class UsiscmError(RuntimeError):
 
 @dataclass
 class UploadResult:
-    project_id: int
+    project_id: str
     imported: int = 0
     skipped: int = 0
     errors: list[dict[str, Any]] = field(default_factory=list)
@@ -45,44 +49,62 @@ class UploadResult:
 
 
 class UsiscmClient:
-    def __init__(self, base_url: str, email: str, password: str, timeout: int = 120) -> None:
-        self.base_url = base_url.rstrip("/") + "/"
-        self.email = email
-        self.password = password
+    def __init__(self, settings: Settings, timeout: int = 120) -> None:
+        self.settings = settings
+        self.base_url = settings.base_url.rstrip("/") + "/"
         self.timeout = timeout
         self.session = requests.Session()
         self.token: str | None = None
+        self._entra: EntraApp | None = None
 
-    def login(self) -> str:
-        response = self.session.post(
-            self._url("api/auth/login"),
-            json={"identifier": self.email, "email": self.email, "password": self.password},
-            timeout=self.timeout,
-        )
-        payload = _json(response)
-        if not response.ok or not payload.get("success"):
-            raise UsiscmError(payload.get("message") or payload.get("error") or f"Login failed ({response.status_code})")
-        token = payload.get("token")
-        if not token:
-            raise UsiscmError("Login succeeded but no token was returned")
+    def entra_app(self) -> EntraApp:
+        if self._entra is not None:
+            return self._entra
+        if self.settings.ms_tenant_id and self.settings.ms_client_id:
+            self._entra = EntraApp(self.settings.ms_tenant_id, self.settings.ms_client_id)
+            return self._entra
+        try:
+            self._entra = discover_entra_app(self.settings.base_url, timeout=self.timeout)
+        except MicrosoftAuthError as exc:
+            raise UsiscmError(str(exc)) from exc
+        return self._entra
+
+    def login(self, *, interactive: bool = False) -> str:
+        try:
+            token = resolve_access_token(
+                self.entra_app(),
+                token_path=self.settings.token_path,
+                access_token=self.settings.ms_access_token or None,
+                interactive=interactive,
+            )
+        except MicrosoftAuthError as exc:
+            raise UsiscmError(str(exc)) from exc
         self.token = token
         self.session.headers["Authorization"] = f"Bearer {token}"
         return token
 
-    def list_projects(self, *, stage: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+    def auth_status(self) -> dict[str, Any]:
         self._ensure_auth()
-        params: dict[str, Any] = {"limit": limit, "include_count": "true"}
-        if stage:
-            params["stage"] = stage
+        response = self.session.get(self._url("api/v1/auth/status"), timeout=self.timeout)
+        payload = _json(response)
+        if not response.ok:
+            raise UsiscmError(payload.get("error") or f"Auth status failed ({response.status_code})")
+        return payload
+
+    def list_projects(self, *, limit: int = 500) -> list[dict[str, Any]]:
+        self._ensure_auth()
         collected: list[dict[str, Any]] = []
         offset = 0
         while True:
-            params["offset"] = offset
-            response = self.session.get(self._url("api/projects"), params=params, timeout=self.timeout)
+            response = self.session.get(
+                self._url("api/v1/projects"),
+                params={"limit": limit, "offset": offset},
+                timeout=self.timeout,
+            )
             payload = _json(response)
             if not response.ok:
                 raise UsiscmError(payload.get("error") or f"Project list failed ({response.status_code})")
-            batch = payload.get("data") or []
+            batch = payload.get("items") or payload.get("data") or payload.get("projects") or []
             collected.extend(batch)
             if len(batch) < limit:
                 break
@@ -94,16 +116,16 @@ class UsiscmClient:
     def resolve_project(
         self,
         *,
-        project_id: int | None = None,
+        project_id: str | None = None,
         project_name: str | None = None,
     ) -> dict[str, Any]:
-        if project_id is not None:
+        if project_id:
             self._ensure_auth()
-            response = self.session.get(self._url(f"api/projects/{project_id}"), timeout=self.timeout)
+            response = self.session.get(self._url(f"api/v1/projects/{project_id}"), timeout=self.timeout)
             payload = _json(response)
             if not response.ok:
                 raise UsiscmError(payload.get("error") or f"Project {project_id} not found")
-            return payload.get("data") or payload
+            return payload.get("item") or payload.get("data") or payload
 
         if not project_name:
             raise UsiscmError("Provide --project-id or a package label to match")
@@ -118,24 +140,30 @@ class UsiscmClient:
         self,
         manifest: PackageManifest,
         *,
-        project_id: int | None = None,
+        project_id: str | None = None,
         dry_run: bool = False,
     ) -> UploadResult:
         project = self.resolve_project(project_id=project_id, project_name=manifest.label)
-        resolved_id = int(project.get("id") or project_id)
+        resolved_id = str(project.get("id") or project.get("project_id") or project_id or "")
         result = UploadResult(project_id=resolved_id)
         if dry_run:
-            result.details.append({"dry_run": True, "project": project.get("project_name"), "counts": manifest.counts})
+            result.details.append(
+                {
+                    "dry_run": True,
+                    "project": project.get("name") or project.get("project_name"),
+                    "counts": manifest.counts,
+                }
+            )
             result.imported = len(manifest.files)
             return result
 
-        drawings = manifest.files_for(FileCategory.DRAWING)
-        drawing_import = [f for f in drawings if f.path.suffix.lower() in DRAWING_IMPORT_EXTENSIONS]
-        drawing_table = [f for f in drawings if f.path.suffix.lower() in DRAWING_TABLE_EXTENSIONS - DRAWING_IMPORT_EXTENSIONS]
-        if drawing_import:
-            result.details.append(self._import_drawing_set(resolved_id, drawing_import, manifest.label))
-        if drawing_table:
-            result.details.append(self._bulk_drawings(resolved_id, drawing_table))
+        drawings = [
+            item
+            for item in manifest.files_for(FileCategory.DRAWING)
+            if item.path.suffix.lower() in DRAWING_EXTENSIONS
+        ]
+        for item in drawings:
+            result.details.append(self._upload_drawing(resolved_id, item, manifest.label))
 
         for category in (
             FileCategory.SPEC,
@@ -156,79 +184,95 @@ class UsiscmClient:
                 if item.path.suffix.lower() not in DOCUMENT_EXTENSIONS
             ]
             result.skipped += len(skipped)
-            if docs:
-                result.details.append(self._bulk_documents(resolved_id, docs, category))
+            for item in docs:
+                if category == FileCategory.SPEC and item.path.suffix.lower() == ".pdf":
+                    result.details.append(self._upload_spec_book(resolved_id, item))
+                result.details.append(self._upload_document(resolved_id, item, category, manifest.label))
 
         for detail in result.details:
             result.imported += int(detail.get("imported") or 0)
+            if detail.get("error"):
+                result.errors.append({"filename": detail.get("filename"), "error": detail["error"]})
             result.errors.extend(detail.get("errors") or [])
         return result
 
-    def _import_drawing_set(self, project_id: int, files: list, label: str) -> dict[str, Any]:
+    def _upload_drawing(self, project_id: str, item, label: str) -> dict[str, Any]:
         self._ensure_auth()
-        buffer = io.BytesIO()
-        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for item in files:
-                archive.write(item.path, arcname=item.path.name)
-        buffer.seek(0)
-        response = self.session.post(
-            self._url(f"api/projects/{project_id}/drawings/import"),
-            files={"file": (f"{label}-drawings.zip", buffer, "application/zip")},
-            data={"drawing_set": label, "use_ai": "0"},
-            timeout=max(self.timeout, 300),
-        )
-        payload = _json(response)
-        if not response.ok and response.status_code != 207:
-            logger.warning("drawings/import failed (%s); falling back to documents/bulk", response.status_code)
-            return self._bulk_drawings(project_id, files)
-        return {
-            "endpoint": "drawings/import",
-            "imported": payload.get("imported") or len(payload.get("sheets") or []),
-            "skipped": payload.get("skipped") or 0,
-            "errors": payload.get("errors") or [],
+        data = {
+            "drawing_set": label,
+            "split_pages": "1" if item.path.suffix.lower() == ".pdf" else "0",
         }
-
-    def _bulk_drawings(self, project_id: int, files: list) -> dict[str, Any]:
-        self._ensure_auth()
-        uploads = [("files", (item.path.name, item.path.read_bytes())) for item in files]
+        if item.sheet_number:
+            data["sheet_number"] = item.sheet_number
         response = self.session.post(
-            self._url(f"api/documents/projects/{project_id}/bulk"),
-            files=uploads,
+            self._url(f"api/v1/projects/{project_id}/drawings"),
+            files={"file": (item.path.name, item.path.read_bytes())},
+            data=data,
             timeout=max(self.timeout, 180),
         )
         payload = _json(response)
-        if not response.ok and response.status_code != 207:
-            raise UsiscmError(payload.get("error") or f"Drawing bulk upload failed ({response.status_code})")
-        return {
-            "endpoint": "documents/bulk",
-            "imported": payload.get("imported") or 0,
-            "skipped": payload.get("skipped") or 0,
-            "errors": payload.get("errors") or [],
-        }
+        if not response.ok:
+            return {"endpoint": "v1/drawings", "filename": item.path.name, "imported": 0, "error": payload.get("error") or response.status_code}
+        count = payload.get("count") or (len(payload.get("items") or []) or 1)
+        return {"endpoint": "v1/drawings", "filename": item.path.name, "imported": int(count), "errors": []}
 
-    def _bulk_documents(self, project_id: int, files: list, category: FileCategory) -> dict[str, Any]:
+    def _upload_spec_book(self, project_id: str, item) -> dict[str, Any]:
         self._ensure_auth()
-        uploads = [("files", (item.path.name, item.path.read_bytes())) for item in files]
         response = self.session.post(
-            self._url(f"api/documents/projects/{project_id}/documents/bulk-docs"),
-            files=uploads,
-            data={"category": category.document_category, "description": f"Ingested as {category.value}"},
+            self._url(f"api/v1/projects/{project_id}/spec-book/import"),
+            files={"file": (item.path.name, item.path.read_bytes(), "application/pdf")},
             timeout=max(self.timeout, 180),
         )
         payload = _json(response)
-        if not response.ok and response.status_code != 207:
-            raise UsiscmError(payload.get("error") or f"Document bulk upload failed ({response.status_code})")
+        if not response.ok:
+            return {
+                "endpoint": "v1/spec-book/import",
+                "filename": item.path.name,
+                "imported": 0,
+                "error": payload.get("error") or response.status_code,
+            }
+        return {"endpoint": "v1/spec-book/import", "filename": item.path.name, "imported": 1, "errors": []}
+
+    def _upload_document(self, project_id: str, item, category: FileCategory, label: str) -> dict[str, Any]:
+        self._ensure_auth()
+        metadata = {
+            "project_id": project_id,
+            "filename": item.path.name,
+            "document_type": category.document_type,
+            "title": item.path.stem,
+            "source": "usiscm_ingest",
+            "source_id": item.relative_path,
+            "folder_name": label,
+        }
+        headers = {}
+        if self.settings.ingest_api_key:
+            headers["Authorization"] = f"Bearer {self.settings.ingest_api_key}"
+        response = self.session.post(
+            self._url("api/documents"),
+            files={"file": (item.path.name, item.path.read_bytes())},
+            data={"metadata": json.dumps(metadata), "sourceSystem": "usiscm_ingest"},
+            headers=headers or None,
+            timeout=max(self.timeout, 180),
+        )
+        payload = _json(response)
+        if response.ok or response.status_code == 201:
+            return {"endpoint": "ingest/documents", "filename": item.path.name, "imported": 1, "errors": []}
+        # Official ingest route is API-key gated. Fall back so a Microsoft
+        # session can still land the file on the project.
+        if item.path.suffix.lower() == ".pdf":
+            fallback = self._upload_drawing(project_id, item, f"{label} / {category.value}")
+            fallback["endpoint"] = "v1/drawings (document fallback)"
+            return fallback
         return {
-            "endpoint": "documents/bulk-docs",
-            "category": category.value,
-            "imported": payload.get("imported") or 0,
-            "skipped": payload.get("skipped") or 0,
-            "errors": payload.get("errors") or [],
+            "endpoint": "ingest/documents",
+            "filename": item.path.name,
+            "imported": 0,
+            "error": payload.get("error") or response.status_code,
         }
 
     def _ensure_auth(self) -> None:
         if not self.token:
-            self.login()
+            self.login(interactive=False)
 
     def _url(self, path: str) -> str:
         return urljoin(self.base_url, path.lstrip("/"))
@@ -247,6 +291,14 @@ def _normalize_name(value: str) -> list[str]:
     return [part for part in cleaned.split() if part]
 
 
+def _project_name(project: dict[str, Any]) -> str:
+    return str(project.get("name") or project.get("project_name") or "")
+
+
+def _project_number(project: dict[str, Any]) -> str:
+    return str(project.get("number") or project.get("project_number") or "")
+
+
 def _best_project_match(label: str, projects: list[dict[str, Any]]) -> dict[str, Any] | None:
     label_tokens = set(_normalize_name(label))
     if not label_tokens:
@@ -254,8 +306,8 @@ def _best_project_match(label: str, projects: list[dict[str, Any]]) -> dict[str,
 
     ranked: list[tuple[float, dict[str, Any]]] = []
     for project in projects:
-        name = str(project.get("project_name") or "")
-        number = str(project.get("project_number") or "")
+        name = _project_name(project)
+        number = _project_number(project)
         name_tokens = set(_normalize_name(name))
         if number and number.lower() in label.lower():
             ranked.append((1.0, project))

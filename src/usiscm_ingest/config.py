@@ -9,6 +9,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from usiscm_ingest.classify import DEFAULT_HINTS, CategoryHints, FileCategory
+from usiscm_ingest.microsoft import DEFAULT_TOKEN_PATH
 
 load_dotenv()
 
@@ -16,8 +17,11 @@ load_dotenv()
 @dataclass
 class Settings:
     base_url: str
-    email: str
-    password: str
+    ms_tenant_id: str = ""
+    ms_client_id: str = ""
+    ms_access_token: str = ""
+    token_path: Path = DEFAULT_TOKEN_PATH
+    ingest_api_key: str = ""
     watch_dir: Path | None = None
     work_dir: Path | None = None
     processed_dir: Path | None = None
@@ -30,10 +34,14 @@ def load_settings() -> Settings:
     work = os.getenv("USISCM_WORK_DIR", "").strip()
     processed = os.getenv("USISCM_PROCESSED_DIR", "").strip()
     failed = os.getenv("USISCM_FAILED_DIR", "").strip()
+    token_path = os.getenv("USISCM_MS_TOKEN_PATH", "").strip()
     return Settings(
         base_url=os.getenv("USISCM_BASE_URL", "https://www.usiscm.com").rstrip("/"),
-        email=os.getenv("USISCM_EMAIL", "").strip(),
-        password=os.getenv("USISCM_PASSWORD", "").strip(),
+        ms_tenant_id=os.getenv("USISCM_MS_TENANT_ID", "").strip(),
+        ms_client_id=os.getenv("USISCM_MS_CLIENT_ID", "").strip(),
+        ms_access_token=os.getenv("USISCM_MS_ACCESS_TOKEN", "").strip(),
+        token_path=Path(token_path).expanduser() if token_path else DEFAULT_TOKEN_PATH,
+        ingest_api_key=os.getenv("USISCM_INGEST_API_KEY", "").strip(),
         watch_dir=Path(watch).expanduser() if watch else None,
         work_dir=Path(work).expanduser() if work else None,
         processed_dir=Path(processed).expanduser() if processed else None,

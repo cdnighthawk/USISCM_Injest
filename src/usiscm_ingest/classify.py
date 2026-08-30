@@ -49,16 +49,16 @@ class FileCategory(str, Enum):
     OTHER = "other"
 
     @property
-    def document_category(self) -> str:
-        """Value sent to the USISCM documents API ``category`` field."""
+    def document_type(self) -> str:
+        """USISCM ``document_type`` for the official ingest / documents APIs."""
         return {
-            FileCategory.DRAWING: "drawings",
-            FileCategory.SPEC: "specs",
-            FileCategory.BID_INSTRUCTIONS: "bid_instructions",
-            FileCategory.ADDENDA: "addenda",
-            FileCategory.REPORT: "reports",
-            FileCategory.SCHEDULE: "schedule",
-            FileCategory.OTHER: "general",
+            FileCategory.DRAWING: "drawing",
+            FileCategory.SPEC: "specification",
+            FileCategory.BID_INSTRUCTIONS: "other",
+            FileCategory.ADDENDA: "other",
+            FileCategory.REPORT: "report",
+            FileCategory.SCHEDULE: "other",
+            FileCategory.OTHER: "other",
         }[self]
 
 

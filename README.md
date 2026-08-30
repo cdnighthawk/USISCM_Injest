@@ -28,7 +28,18 @@ PDF first-page text is optional and only used with `--peek-pdf`:
 pip install -e ".[pdf]"
 ```
 
-Copy `.env.example` to `.env` and set `USISCM_EMAIL` / `USISCM_PASSWORD`.
+Copy `.env.example` to `.env`. Sign in with **Microsoft** (the same SSO used on [usiscm.com](https://www.usiscm.com)) — there is no email/password login for this script.
+
+```bash
+usiscm-ingest login
+```
+
+That prints a Microsoft device code. Open the URL, sign in with your USIS work account, then the token is stored under `~/.config/usiscm-ingest/ms_tokens.json`. Tenant and client id are read from `/auth/microsoft/start` unless you set `USISCM_MS_TENANT_ID` / `USISCM_MS_CLIENT_ID`.
+
+```bash
+usiscm-ingest whoami
+usiscm-ingest logout
+```
 
 ## Classify a package
 
@@ -46,18 +57,18 @@ usiscm-ingest classify ./package --json manifest.json
 # Match a project by the package label (zip/folder name, with optional suffixes stripped)
 usiscm-ingest import /data/drops/some-bid-set.zip
 
-# Or pin the project id
-usiscm-ingest import /data/drops/some-bid-set.zip --project-id 42
+# Or pin the project UUID
+usiscm-ingest import /data/drops/some-bid-set.zip --project-id 00000000-0000-0000-0000-000000000000
 
 # Review the match without uploading
 usiscm-ingest import /data/drops/some-bid-set.zip --dry-run
 ```
 
-Uploads:
+Uploads use your Microsoft token the same way the USIS desktop app does:
 
-- Drawing PDFs/images → `POST /api/projects/{id}/drawings/import`
-- CAD drawings → `POST /api/documents/projects/{id}/bulk`
-- Specs, bid instructions, addenda, reports, schedules, other → `POST /api/documents/projects/{id}/documents/bulk-docs` with a category
+- Drawing PDFs/images → `POST /api/v1/projects/{id}/drawings`
+- Spec PDFs → `POST /api/v1/projects/{id}/spec-book/import` plus the documents ingest API
+- Other categories → `POST /api/documents` (optional `USISCM_INGEST_API_KEY` if your site requires the machine ingest key for that route)
 
 ## Watch a drop folder on the server
 
