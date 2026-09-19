@@ -1,0 +1,11 @@
+.env
+ms_tokens.json
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.usiscm-ingest-work/
+.pytest_cache/
+.mypy_cache/

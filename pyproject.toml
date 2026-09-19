@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "usiscm-ingest"
+version = "0.2.0"
+description = "Watch downloaded files, auto-name drawings, and ingest them into USISCM + Backblaze B2"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "USIS" }]
+dependencies = [
+    "requests>=2.31.0",
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+pdf = ["pymupdf>=1.24.0"]
+dev = ["pytest>=8.0.0"]
+
+[project.scripts]
+usiscm-ingest = "usiscm_ingest.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
