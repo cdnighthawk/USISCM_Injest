@@ -1,0 +1,53 @@
+# Optional hint overrides. Office-specific folder words can be added here
+# without changing code. Built-in hints already cover common construction
+# package layouts; this file is only needed when a GC uses unusual names.
+hints:
+  drawing:
+    folders:
+      - drawing
+      - drawings
+      - plans
+      - sheets
+    filenames:
+      - drawing
+      - plan set
+      - floor plan
+    text:
+      - sheet number
+      - drawing number
+  spec:
+    folders:
+      - spec
+      - specs
+      - project manual
+    filenames:
+      - specification
+      - project manual
+    text:
+      - project manual
+      - specifications
+  bid_instructions:
+    folders:
+      - bid
+      - bidding
+      - procurement
+    filenames:
+      - instructions to bidders
+      - invitation to bid
+      - itb
+      - bid form
+    text:
+      - instructions to bidders
+      - invitation to bid
+  addenda:
+    folders: [addendum, addenda, bulletin]
+    filenames: [addendum, addenda, bulletin]
+    text: [addendum no, this addendum]
+  report:
+    folders: [report, geotech, soils, survey]
+    filenames: [geotechnical, soils report, survey]
+    text: [geotechnical, boring log]
+  schedule:
+    folders: [schedule, cpm]
+    filenames: [schedule, baseline schedule]
+    text: [critical path]
