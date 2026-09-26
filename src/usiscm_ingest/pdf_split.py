@@ -13,6 +13,10 @@ Each page is split on its own. A MuPDF stack overflow on one page is retried
 on a fresh document, then extracted with pikepdf (when installed) or pypdf.
 That page is skipped and logged if every backend fails. The rest of the set
 is still returned.
+
+Each written sheet is rewritten with unused objects removed. A page resource
+dictionary often names images and fonts for the whole set; saving without
+that cleanup stores the full document in every one-page file.
 """
 
 from __future__ import annotations
@@ -121,15 +125,58 @@ def _page_text_mupdf(doc: object, index: int) -> str:
     return page.get_text("text") or ""
 
 
+# Keep only the objects this page actually paints. garbage collects objects
+# that clean() dropped from the resource dictionary; deflate packs the rest.
+_COMPACT_SAVE = {"garbage": 4, "clean": True, "deflate": True}
+
+
+def _save_compact(doc: object, out: Path) -> None:
+    doc.save(out, **_COMPACT_SAVE)  # type: ignore[attr-defined]
+
+
 def _write_page_mupdf(doc: object, index: int, out: Path) -> None:
     import pymupdf
 
     single = pymupdf.open()
     try:
-        single.insert_pdf(doc, from_page=index, to_page=index)
-        single.save(out)
+        # Links, annotations, and widgets can point at other pages and pull
+        # those pages' objects into this file.
+        single.insert_pdf(
+            doc,
+            from_page=index,
+            to_page=index,
+            links=False,
+            annots=False,
+            widgets=False,
+        )
+        _save_compact(single, out)
     finally:
         single.close()
+
+
+def _compact_page_file(path: Path) -> None:
+    """Rewrite a one-page PDF so unused resources are not stored."""
+    import pymupdf
+
+    doc = pymupdf.open(path)
+    tmp = path.with_name(path.name + ".compact")
+    try:
+        _save_compact(doc, tmp)
+    finally:
+        doc.close()
+    tmp.replace(path)
+
+
+def _try_compact_page_file(path: Path) -> None:
+    """Compact a fallback extract. Keep the uncompacted file if the rewrite fails.
+
+    The caller still rejects a file that is about as large as the whole set.
+    """
+    try:
+        _compact_page_file(path)
+    except Exception as exc:
+        logger.warning("could not rewrite %s to drop unused objects: %s", path.name, exc)
+        _discard(path.with_name(path.name + ".compact"))
 
 
 def _mupdf_export_page(doc: object, index: int, out: Path) -> str:
@@ -155,6 +202,7 @@ def _split_page_pikepdf(path: Path, index: int, out: Path) -> str:
         dest = pikepdf.Pdf.new()
         dest.pages.append(pdf.pages[index])
         dest.save(out)
+    _try_compact_page_file(out)
     return ""
 
 
@@ -167,6 +215,7 @@ def _split_page_pypdf(path: Path, index: int, out: Path) -> str:
     writer.add_page(page)
     with out.open("wb") as handle:
         writer.write(handle)
+    _try_compact_page_file(out)
     try:
         return page.extract_text() or ""
     except Exception as exc:
@@ -218,7 +267,28 @@ def _reopen_or_drop(path: Path, doc: object | None) -> object | None:
         return None
 
 
-def _export_one_page(path: Path, doc: object | None, index: int, out: Path) -> tuple[str | None, object | None]:
+def _sheet_is_whole_document(out: Path, source: Path, page_count: int) -> bool:
+    """True when a one-page file still weighs almost as much as the whole set."""
+    if page_count < 3:
+        return False
+    try:
+        out_size = out.stat().st_size
+        source_size = source.stat().st_size
+    except OSError:
+        return False
+    if source_size <= 0:
+        return False
+    return out_size > int(source_size * 0.85)
+
+
+def _export_one_page(
+    path: Path,
+    doc: object | None,
+    index: int,
+    out: Path,
+    *,
+    page_count: int,
+) -> tuple[str | None, object | None]:
     """Write one page. Returns ``(text, doc)`` or ``(None, doc)`` when it failed.
 
     MuPDF is tried once. A non-overflow error is retried on a freshly opened
@@ -232,6 +302,11 @@ def _export_one_page(path: Path, doc: object | None, index: int, out: Path) -> t
         for attempt in (1, 2):
             try:
                 text = _mupdf_export_page(doc, index, out)
+                if _sheet_is_whole_document(out, path, page_count):
+                    raise RuntimeError(
+                        f"page file is {out.stat().st_size} bytes, "
+                        f"near the full {path.stat().st_size}-byte document"
+                    )
                 if attempt == 2:
                     logger.info("MuPDF split recovered on retry for page %s of %s", page_number, path.name)
                 return text, doc
@@ -254,6 +329,11 @@ def _export_one_page(path: Path, doc: object | None, index: int, out: Path) -> t
     _close_mupdf(doc)
     try:
         text = _fallback_split_page(path, index, out)
+        if _sheet_is_whole_document(out, path, page_count):
+            raise RuntimeError(
+                f"fallback page file is {out.stat().st_size} bytes, "
+                f"near the full {path.stat().st_size}-byte document"
+            )
     except Exception as exc:
         errors.append(f"fallback: {exc}")
         _discard(out)
@@ -304,7 +384,7 @@ def inspect_pdf(path: Path, dest_dir: Path) -> PdfInspection:
         stem = _work_stem(path)
         for index in range(count):
             out = dest_dir / f"{stem}__sheet-{index + 1:04d}.pdf"
-            text, current = _export_one_page(path, current, index, out)
+            text, current = _export_one_page(path, current, index, out, page_count=count)
             if text is None:
                 failed.append(index + 1)
                 continue

@@ -220,6 +220,93 @@ def test_client_keeps_other_sheets_when_one_page_fails(tmp_path: Path) -> None:
     assert all(sheet.path.name != source.name for sheet in drawings)
 
 
+def _shared_unused_resource_pdf(tmp_path: Path) -> Path:
+    """Multi-page drawing whose every page names the same unused images.
+
+    A page copy that does not rewrite the file keeps those images, so each
+    one-page PDF is about as large as the whole set.
+    """
+    import os
+
+    from pypdf import PdfWriter
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject, NumberObject
+
+    source = tmp_path / "Drawings" / "ADD_01_HVAC_DWG.pdf"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    writer = PdfWriter()
+    image_refs = []
+    for index in range(4):
+        image = DecodedStreamObject()
+        image.set_data(os.urandom(900_000))
+        image.update(
+            {
+                NameObject("/Type"): NameObject("/XObject"),
+                NameObject("/Subtype"): NameObject("/Image"),
+                NameObject("/Width"): NumberObject(900),
+                NameObject("/Height"): NumberObject(1000),
+                NameObject("/ColorSpace"): NameObject("/DeviceGray"),
+                NameObject("/BitsPerComponent"): NumberObject(8),
+            }
+        )
+        image_refs.append(writer._add_object(image))
+
+    sheets = ("M-101", "M-102", "M-103", "M-104")
+    for sheet in sheets:
+        page = writer.add_blank_page(width=612, height=792)
+        content = DecodedStreamObject()
+        content.set_data(f"BT /F1 12 Tf 72 700 Td (SHEET NO. {sheet}) Tj ET".encode())
+        page[NameObject("/Contents")] = writer._add_object(content)
+        xobjects = DictionaryObject(
+            {NameObject(f"/Unused{index}"): ref for index, ref in enumerate(image_refs)}
+        )
+        page[NameObject("/Resources")] = DictionaryObject({NameObject("/XObject"): xobjects})
+    with source.open("wb") as handle:
+        writer.write(handle)
+    return source
+
+
+def test_split_pages_are_not_copies_of_the_whole_file(tmp_path: Path) -> None:
+    source = _shared_unused_resource_pdf(tmp_path)
+    source_size = source.stat().st_size
+    doc = pymupdf.open(source)
+    naive = tmp_path / "naive.pdf"
+    try:
+        _real_mupdf_write(doc, 0, naive)
+    finally:
+        doc.close()
+    assert naive.stat().st_size > int(source_size * 0.85)
+    assert _page_count(naive) == 1
+
+    item = classify_file(source, root=tmp_path)
+    assert item is not None
+    assert item.category == FileCategory.DRAWING
+    sheets = expand_drawing_file(item, tmp_path / "work")
+    assert [sheet.sheet_number for sheet in sheets] == ["M-101", "M-102", "M-103", "M-104"]
+    assert all(sheet.from_split for sheet in sheets)
+    assert all(sheet.path != source.resolve() for sheet in sheets)
+    assert all(_page_count(sheet.path) == 1 for sheet in sheets)
+    sizes = [sheet.path.stat().st_size for sheet in sheets]
+    assert all(size * 2 < source_size for size in sizes)
+    assert sum(sizes) < source_size
+
+
+def test_page_that_stays_document_sized_is_skipped(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    source = _shared_unused_resource_pdf(tmp_path)
+
+    def save_without_cleanup(doc, out: Path) -> None:
+        doc.save(out)
+
+    with caplog.at_level("ERROR"):
+        with patch("usiscm_ingest.pdf_split._save_compact", side_effect=save_without_cleanup):
+            item = classify_file(source, root=tmp_path)
+            assert item is not None
+            with pytest.raises(PdfSplitError, match="failed pages: 1, 2, 3, 4"):
+                expand_drawing_file(item, tmp_path / "work")
+    assert "near the full" in caplog.text
+    leftovers = list((tmp_path / "work").rglob("*.pdf"))
+    assert leftovers == []
+
+
 def test_every_page_failing_does_not_return_the_whole_file(tmp_path: Path) -> None:
     source = _three_sheet_pdf(tmp_path)
     item = classify_file(source, root=tmp_path)
