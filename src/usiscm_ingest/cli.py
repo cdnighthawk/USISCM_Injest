@@ -9,6 +9,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from usiscm_ingest.client import UsiscmClient, UsiscmError
 from usiscm_ingest.config import load_settings
@@ -82,6 +83,19 @@ def main(argv: list[str] | None = None) -> int:
         help="Re-import every file, even if it has not changed",
     )
 
+    specialty = sub.add_parser(
+        "specialty-run",
+        help="Run queued specialty takeoff jobs one project and one script at a time",
+    )
+    specialty.add_argument(
+        "--once",
+        action="store_true",
+        help="Drain currently ready projects and exit (for Task Scheduler)",
+    )
+    specialty.add_argument("--interval", type=int, help="Seconds between polls when not --once")
+    specialty.add_argument("--runners", type=Path, help="YAML map of specialty → command or module")
+    specialty.add_argument("--max-jobs", type=int, help="Stop after this many projects in one pass")
+
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -102,6 +116,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_import(args)
     if args.command == "watch":
         return _cmd_watch(args)
+    if args.command == "specialty-run":
+        return _cmd_specialty_run(args)
     parser.error(f"Unknown command {args.command}")
     return 2
 
@@ -318,6 +334,67 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     while True:
         run_once()
         time.sleep(interval)
+
+
+def _cmd_specialty_run(args: argparse.Namespace) -> int:
+    """Separate from watch. One worker, one project, one script."""
+    from usiscm_ingest.specialty_runner import RUNNERS_ENV, ConfiguredScripts, load_runners_file
+
+    settings = load_settings()
+    path = args.runners or settings.specialty_runners_path
+    try:
+        specs = load_runners_file(path)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.error("specialty runners: %s", exc)
+        return 2
+    if not specs:
+        logger.error(
+            "No specialty runners configured. Set %s or pass --runners. "
+            "See usiscm-specialty-runners.example.yaml",
+            RUNNERS_ENV,
+        )
+        return 2
+    scripts = ConfiguredScripts(specs)
+    if args.once:
+        return _specialty_pass(scripts, max_jobs=args.max_jobs)
+    interval = args.interval or settings.poll_seconds
+    logger.info("Specialty runner polling every %ss (one project, one script)", interval)
+    while True:
+        code = _specialty_pass(scripts, max_jobs=args.max_jobs)
+        if code == 2:
+            return 2
+        time.sleep(interval)
+
+
+def _specialty_pass(scripts: Any, max_jobs: int | None) -> int:
+    from usiscm_ingest.specialty_runner import SpecialtyRunnerBusy, run_queue
+
+    try:
+        report = run_queue(scripts, max_jobs=max_jobs)
+    except SpecialtyRunnerBusy as exc:
+        logger.error("%s", exc)
+        return 2
+    for project in report.projects:
+        logger.info(
+            "specialty project %s status=%s",
+            project.project_key or project.job_id,
+            project.status,
+        )
+    if report.waiting_job_id:
+        logger.info(
+            "specialty runner waiting on %s (%s)",
+            report.waiting_job_id,
+            report.waiting_reason,
+        )
+    elif report.skipped_null_folder:
+        logger.info(
+            "%d queued job(s) still waiting on folder_path (pending takeoff)",
+            report.skipped_null_folder,
+        )
+    if report.blocked_job_id:
+        logger.error("specialty queue blocked on %s: %s", report.blocked_job_id, report.blocked_reason)
+        return 2
+    return 1 if report.failed else 0
 
 
 def _client(settings) -> UsiscmClient:

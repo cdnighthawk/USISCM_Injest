@@ -1,0 +1,51 @@
+# Plug-in map for `usiscm-ingest specialty-run`.
+#
+# Copy this file, set a command or module for each specialty you run, then
+# point USIS_SPECIALTY_RUNNERS (or --runners) at the copy.
+#
+# One worker only. It is not started by `usiscm-ingest watch`.
+# One project at a time (FIFO by enqueued_at). One script at a time inside
+# that project. The next project starts only after the current project's
+# scripts have all finished.
+#
+# Jobs with folder_path null stay in queued/ until a later patch sets the
+# path and status ready_for_takeoff. Do not hard-code an estimate-folder
+# drive in this file. Scripts receive {folder_path} from the queue job.
+#
+# module: "package.module:function"
+#   function(specialty: str, job: dict) -> None
+#   job includes project_key, folder_path, source_paths, cm_ids, file_ids.
+#
+# command: argv list. Placeholders:
+#   {specialty} {job_id} {project_key} {folder_path} {project_id} {estimate_id}
+# Environment also set for the process:
+#   USIS_SPECIALTY, USIS_SPECIALTY_JOB_ID, USIS_SPECIALTY_PROJECT_KEY,
+#   USIS_SPECIALTY_FOLDER_PATH, USIS_SPECIALTY_JOB_FILE, USIS_SPECIALTY_SOURCE_PATHS
+#
+# runners:
+#   lockers:
+#     command:
+#       - python
+#       - C:\usis-cm\specialties\lockers.py
+#       - --folder
+#       - "{folder_path}"
+#       - --project
+#       - "{project_key}"
+#   concrete:
+#     module: estimating_specialties.concrete:run
+#   door_spec:
+#     command: ["python", "C:\\usis-cm\\specialties\\door_spec.py", "--folder", "{folder_path}"]
+#   room_interiors:
+#     module: estimating_specialties.room_interiors:run
+#   wall_protection:
+#     module: estimating_specialties.wall_protection:run
+#   partitions:
+#     module: estimating_specialties.partitions:run
+#   fec:
+#     module: estimating_specialties.fec:run
+#   millwork:
+#     module: estimating_specialties.millwork:run
+#   bathroom_accessories:
+#     module: estimating_specialties.bathroom_accessories:run
+
+runners: {}

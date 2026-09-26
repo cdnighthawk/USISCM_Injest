@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=oneshot
 EnvironmentFile=/etc/usiscm-ingest.env
 WorkingDirectory=/opt/usiscm-ingest
+# Ingest only. Specialty scripts run in usiscm-ingest-specialty.service.
 ExecStart=/opt/usiscm-ingest/.venv/bin/usiscm-ingest watch --once
 Nice=10
 

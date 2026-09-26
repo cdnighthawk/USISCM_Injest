@@ -36,6 +36,7 @@ class Settings:
     leave_in_place: bool = True
     sheet_ai: bool = True
     upload_timeout: int = 600
+    specialty_runners_path: Path | None = None
 
 
 def _path_env(name: str, default: Path | None = None) -> Path | None:
@@ -70,6 +71,7 @@ def load_settings() -> Settings:
         leave_in_place=_bool_env("USISCM_LEAVE_IN_PLACE", True),
         sheet_ai=_bool_env("USISCM_SHEET_AI", True),
         upload_timeout=int(os.getenv("USISCM_UPLOAD_TIMEOUT", "600")),
+        specialty_runners_path=_path_env("USIS_SPECIALTY_RUNNERS"),
     )
 
 

@@ -1,0 +1,25 @@
+{
+  "schema": "usis.specialty_takeoff.v1",
+  "job_id": "3d9bb408-473f-41b3-b2c9-dd4f0e0111fe",
+  "project_key": "HO-2026-0042",
+  "cm_ids": {
+    "project_id": "proj_abc123",
+    "estimate_id": null
+  },
+  "source_paths": [
+    "C:\\Users\\CharlesDossett\\DC\\ACCDocs\\HO-2026-0042\\plans.pdf"
+  ],
+  "specialties": ["all"],
+  "folder_path": null,
+  "estimate_folder": null,
+  "enqueued_at": "2026-09-25T22:16:00Z",
+  "status": "queued",
+  "trigger": "ingest_ok",
+  "file_ids": ["draw-1"],
+  "error": null,
+  "claimed_at": null,
+  "claimed_by": null,
+  "finished_at": null,
+  "source": "usiscm_ingest",
+  "batch_id": "ab12cd34ef567890"
+}

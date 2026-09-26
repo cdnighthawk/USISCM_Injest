@@ -1,0 +1,16 @@
+[Unit]
+Description=USISCM serial specialty takeoff runner (one project, one script)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/usiscm-ingest.env
+WorkingDirectory=/opt/usiscm-ingest
+# Separate from usiscm-ingest.service (watch). Do not run two of these.
+ExecStart=/opt/usiscm-ingest/.venv/bin/usiscm-ingest specialty-run
+Restart=on-failure
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

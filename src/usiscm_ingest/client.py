@@ -262,15 +262,16 @@ class UsiscmClient:
             result.imported = len(manifest.files)
             return result
 
+        stored: list[tuple[str, dict[str, Any]]] = []
         drawings = [
             item
             for item in manifest.files_for(FileCategory.DRAWING)
             if item.path.suffix.lower() in DRAWING_EXTENSIONS
         ]
         for item in drawings:
-            result.details.append(
-                self._upload_drawing(project, item, manifest.label, batch_id=result.batch_id)
-            )
+            detail = self._upload_drawing(project, item, manifest.label, batch_id=result.batch_id)
+            result.details.append(detail)
+            stored.append((str(item.path), detail))
 
         for category in (
             FileCategory.SPEC,
@@ -292,9 +293,11 @@ class UsiscmClient:
             ]
             result.skipped += len(skipped)
             for item in docs:
-                result.details.append(
-                    self._upload_document(project, item, category, manifest.label, batch_id=result.batch_id)
+                detail = self._upload_document(
+                    project, item, category, manifest.label, batch_id=result.batch_id
                 )
+                result.details.append(detail)
+                stored.append((str(item.path), detail))
 
         for detail in result.details:
             result.imported += int(detail.get("imported") or 0)
@@ -303,7 +306,52 @@ class UsiscmClient:
             result.errors.extend(detail.get("errors") or [])
             if detail.get("issue"):
                 result.issues.append(detail["issue"])
+        # One specialty-takeoff job per clean batch. Queue errors stay in the log.
+        self._enqueue_specialty_takeoff(result, project, manifest, stored)
         return result
+
+    def _enqueue_specialty_takeoff(
+        self,
+        result: UploadResult,
+        project: dict[str, Any],
+        manifest: PackageManifest,
+        stored: list[tuple[str, dict[str, Any]]],
+    ) -> None:
+        """Enqueue one ``usis.specialty_takeoff.v1`` job after a clean upload.
+
+        Grain is one ``import_package`` call (one project, the files in that
+        run). ``import`` and ``watch`` both come through here. ``folder_path``
+        stays null; this app does not invent an estimate-folder location.
+        """
+        if result.errors or result.imported <= 0:
+            return
+        paths: list[str] = []
+        file_ids: list[str] = []
+        for path, detail in stored:
+            if detail.get("error") or detail.get("errors") or not int(detail.get("imported") or 0):
+                continue
+            paths.append(path)
+            file_id = detail.get("drawing_id") or detail.get("document_id") or detail.get("file_id")
+            if file_id:
+                file_ids.append(str(file_id))
+        if not paths:
+            return
+        try:
+            from usiscm_ingest.specialty_takeoff import enqueue_specialty_takeoff
+
+            enqueue_specialty_takeoff(
+                project_key=_specialty_project_key(project, manifest),
+                project_id=result.project_id or None,
+                estimate_id=_estimate_id(project),
+                folder_path=None,
+                source_paths=paths,
+                specialties=["all"],
+                trigger="ingest_ok",
+                file_ids=file_ids,
+                extra={"batch_id": result.batch_id} if result.batch_id else None,
+            )
+        except Exception as exc:
+            logger.warning("specialty takeoff enqueue failed: %s", exc)
 
     def report_issue(
         self,
@@ -693,6 +741,23 @@ def _project_name(project: dict[str, Any]) -> str:
 
 def _project_number(project: dict[str, Any]) -> str:
     return str(project.get("number") or project.get("project_number") or "")
+
+
+def _specialty_project_key(project: dict[str, Any], manifest: PackageManifest) -> str:
+    """Prefer an explicit key, then the project number, then the display name."""
+    for key in ("project_key", "number", "project_number", "name", "project_name"):
+        value = project.get(key)
+        if value:
+            return str(value)
+    return str(manifest.label or "")
+
+
+def _estimate_id(project: dict[str, Any]) -> str | None:
+    for key in ("estimate_id", "estimateId"):
+        value = project.get(key)
+        if value:
+            return str(value)
+    return None
 
 
 def _job_id(project: dict[str, Any]) -> str:
