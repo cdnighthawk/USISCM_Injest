@@ -48,7 +48,7 @@ Sign in once during the day so a Microsoft refresh token is saved. That is what 
 usiscm-ingest login
 ```
 
-Optionally also set `USISCM_INGEST_API_KEY` (same key as Autodesk ingest: `CM_INGEST_API_KEY` / `CM_API_KEY`) so documents can use the bearer ingest API.
+Optionally also set `USISCM_INGEST_API_KEY` (same key as Autodesk ingest: `CM_INGEST_API_KEY` / `CM_API_KEY`). With a Microsoft session, drawings and documents both use the website session routes. The ingest key is the night fallback when Microsoft is down: it still registers JSON only, then this PC uploads the file to native B2.
 
 ```bash
 # /etc/usiscm-ingest.env
@@ -88,14 +88,20 @@ usiscm-ingest import /data/drops/some-bid-set.zip --project-id 00000000-0000-000
 usiscm-ingest import /data/drops/some-bid-set.zip --dry-run
 ```
 
-Drawings:
+Drawings and documents (specs, addenda, reports, other files) use the same native B2 path. File bytes never go through Render. Multipart `POST /api/drawings` and `POST /api/documents` are rejected by the website (`410` `AGENT_MULTIPART_FORBIDDEN`).
 
-1. Auto-name from path (optional website sheet-identity AI if PyMuPDF is installed)
-2. `POST /api/v1/jobs/{jobId}/drawings` (metadata only)
+Microsoft session:
+
+1. Auto-name drawings from the path (optional website sheet-identity AI if PyMuPDF is installed)
+2. `POST /api/v1/jobs/{jobId}/drawings` or `POST /api/v1/jobs/{jobId}/documents` (metadata only)
 3. Native `b2_upload_file` from this PC
-4. `POST /api/v1/drawings/{id}/ack-file`
+4. `POST /api/v1/drawings/{id}/ack-file` or `POST /api/v1/documents/{id}/ack-file`
 
-Documents go to `POST /api/documents` (ingest key) or `POST /api/v1/ingest/files` (Microsoft session).
+Ingest API key (no Microsoft session):
+
+1. `POST /api/drawings` or `POST /api/documents` with JSON metadata
+2. Native `b2_upload_file` from this PC
+3. `POST /api/drawings/{id}/ack-file` or `POST /api/documents/{id}/ack-file`
 
 ## Watch downloaded files
 
