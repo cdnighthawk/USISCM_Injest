@@ -86,6 +86,14 @@ class UsiscmError(RuntimeError):
     pass
 
 
+class UnattendedAuthError(UsiscmError):
+    """Night job cannot renew Microsoft auth and must exit.
+
+    Device-code login is only for ``usiscm-ingest login`` during the day.
+    Watch, import, and reprocess never wait on it.
+    """
+
+
 class RefreshingSession(requests.Session):
     """Website session that renews Microsoft auth and retries one 401.
 
@@ -200,8 +208,14 @@ class UsiscmClient:
                 )
                 return self._apply_microsoft(tokens)
             except (MicrosoftAuthError, UsiscmError) as exc:
+                if isinstance(exc, UnattendedAuthError):
+                    raise
                 microsoft_error = MicrosoftAuthError(str(exc))
                 if not self.settings.ingest_api_key:
+                    if not interactive:
+                        raise UnattendedAuthError(
+                            f"{exc} Night ingest will exit and will not wait for a device login."
+                        ) from exc
                     raise UsiscmError(str(exc)) from exc
                 logger.warning("Microsoft session unavailable (%s); using ingest API key", exc)
 
@@ -535,6 +549,8 @@ class UsiscmClient:
                 uploaded = self._upload_drawing_native_b2(project, item, named, label)
             else:
                 uploaded = self._upload_drawing_ingest_key(project_id, item, named, label)
+        except UnattendedAuthError:
+            raise
         except (UsiscmError, B2Error, OSError) as exc:
             code = getattr(exc, "code", None)
             message = str(exc)
@@ -832,6 +848,8 @@ class UsiscmClient:
             if self.uses_microsoft:
                 return self._upload_document_native_b2(project, item, category, label)
             return self._upload_document_ingest_key(project_id, item, category, label)
+        except UnattendedAuthError:
+            raise
         except (UsiscmError, B2Error, OSError) as exc:
             code = getattr(exc, "code", None)
             self.report_issue(
@@ -1005,6 +1023,8 @@ class UsiscmClient:
             return False
         current = self._microsoft_tokens or load_tokens(self.settings.token_path)
         if current is None:
+            if force:
+                raise _unattended_auth_error("Microsoft session has no saved tokens to refresh.")
             logger.error("Microsoft session has no saved tokens to refresh")
             return False
         skew = max(REFRESH_SKEW_SECONDS, int(self.settings.upload_timeout) + 180)
@@ -1012,11 +1032,9 @@ class UsiscmClient:
             self._microsoft_tokens = current
             return False
         if not current.refresh_token:
-            logger.error(
-                "Microsoft access token needs renewal but no refresh token is saved. "
-                "Run `usiscm-ingest login` once. Night jobs cannot prompt."
+            raise _unattended_auth_error(
+                "Microsoft access token needs renewal but no refresh token is saved."
             )
-            return False
         if force:
             logger.warning("Microsoft API returned 401; refreshing the access token")
         else:
@@ -1025,8 +1043,11 @@ class UsiscmClient:
         try:
             refreshed = refresh_tokens(self.entra_app(), current.refresh_token, timeout=min(self.timeout, 60))
         except MicrosoftAuthError as exc:
-            logger.error("Microsoft token refresh failed: %s", exc)
-            return False
+            raise _unattended_auth_error(f"Microsoft rejected the refresh token ({exc}).") from exc
+        except requests.RequestException as exc:
+            raise _unattended_auth_error(
+                f"Could not reach Microsoft to refresh the access token ({exc})."
+            ) from exc
         save_tokens(self.settings.token_path, refreshed)
         self._microsoft_tokens = refreshed
         self.token = refreshed.access_token
@@ -1063,6 +1084,13 @@ class UsiscmClient:
 
     def _url(self, path: str) -> str:
         return urljoin(self.base_url, path.lstrip("/"))
+
+
+def _unattended_auth_error(detail: str) -> UnattendedAuthError:
+    """Clear night-job failure. Callers log this and exit; they do not prompt."""
+    return UnattendedAuthError(
+        f"{detail} Night ingest will exit and will not wait for a device login. {UNATTENDED_HINT}"
+    )
 
 
 def _name_item(item) -> DrawingName:
