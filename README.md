@@ -4,7 +4,9 @@ Watch files Autodesk Desktop Connector (or another drop folder) downloads, **nam
 
 This is the same upload path the USIS PDF app uses: the website stores the catalog row, the PDF is POSTed from this machine to native B2, then the website is acked. Bytes do not go through Render.
 
-The PDF-app drawing namer is automated here. Sheet number, title, discipline, set, and revision are read from the filename and folder (`A1-001_BCK-1.pdf` under `Architectural/Permit-Set/`). If the name is missing or does not look like a real sheet id, the file **still uploads** and a review item is posted to `POST /api/v1/ingest/errors` so it appears in the CM ingest tracker when someone opens the app.
+Multi-page **drawing** PDFs are split on this PC into one PDF per sheet before native B2 upload. Sheet number, title, discipline, set, and revision are read from that sheet's title block (and, for a file that is already one sheet, from the filename and folder, such as `A1-001_BCK-1.pdf` under `Architectural/Permit-Set/`). Package and form tokens (`PKG1`, `ADD01`, `NO.4`, `W9`) are not sheet numbers. If the name is missing or does not look like a real sheet id, the sheet **still uploads** and a review item is posted to `POST /api/v1/ingest/errors` so it appears in the CM ingest tracker when someone opens the app.
+
+Specs, addenda, bid forms, W-9s, RFP/RFQ, manuals, and combined bid sets go to the documents API only. They are not sheet-split onto the Drawings page.
 
 GC offices do **not** share one package layout. A Turner progress-print zip, a numbered Swinerton folder tree, and a flat Webcor dump are all valid. The importer never requires a project-name pattern, `Progress Print` suffix, or revision scheme. It scores each file as:
 
@@ -26,11 +28,7 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-PDF first-page text and title-block crops are optional (`--peek-pdf` / `USISCM_SHEET_AI`):
-
-```bash
-pip install -e ".[pdf]"
-```
+Sheet split uses PyMuPDF, which is installed with the package. `--peek-pdf` / `USISCM_SHEET_AI` still control first-page classification text and the website title-block AI.
 
 Copy `.env.example` to `.env` on the **server**. Night jobs do not open a Microsoft login.
 
@@ -92,10 +90,15 @@ Drawings and documents (specs, addenda, reports, other files) use the same nativ
 
 Microsoft session:
 
-1. Auto-name drawings from the path (optional website sheet-identity AI if PyMuPDF is installed)
-2. `POST /api/v1/jobs/{jobId}/drawings` or `POST /api/v1/jobs/{jobId}/documents` (metadata only)
-3. Native `b2_upload_file` from this PC
-4. `POST /api/v1/drawings/{id}/ack-file` or `POST /api/v1/documents/{id}/ack-file`
+1. Split each multi-page drawing PDF into one PDF per sheet. Name each sheet from its own text. Leave specs, addenda, bid forms, W-9s, manuals, and combined bid sets whole, on the documents path.
+2. Auto-name any sheet the title block did not fill (optional website sheet-identity AI)
+3. `POST /api/v1/jobs/{jobId}/drawings` or `POST /api/v1/jobs/{jobId}/documents` (metadata only, one row per sheet or document)
+4. Native `b2_upload_file` from this PC
+5. `POST /api/v1/drawings/{id}/ack-file` or `POST /api/v1/documents/{id}/ack-file`
+
+`split_pages` stays false in the ingest-key JSON. The split already happened here; the website must not split the file again, and file bytes still do not go through Render.
+
+If the job's estimate folder **already exists**, pass `--estimate-folder` (or a project `folder_path` / `estimate_folder` the website already returned). Each sheet is also copied to `<folder>\02_Processed\drawings`. A missing folder is skipped. This app does not create `Y:\Estimates` or any other estimate root.
 
 Ingest API key (no Microsoft session):
 
@@ -110,7 +113,35 @@ usiscm-ingest watch --once
 usiscm-ingest watch
 ```
 
-`--reprocess` forces every file again. `--move` is only for a throwaway zip drop folder that is **not** ACCDocs.
+`--reprocess` forces every selected file again. `--package` limits the scan to one ACC project (folder name or path fragment). `--move` is only for a throwaway zip drop folder that is **not** ACCDocs.
+
+### Reprocess one package after install
+
+Install this version on the data server, then force one job (for example ACC project `26092`) through sheet split. Other projects are not touched:
+
+```bash
+usiscm-ingest watch --once --reprocess --package 26092
+```
+
+That re-reads the ACCDocs package whose path contains `26092`, splits multi-page drawing PDFs, uploads each sheet to native B2, and sends addenda, specs, W-9s, RFPs, manuals, and combined bid sets to documents only.
+
+To also drop the sheets into an estimate folder that is already on disk:
+
+```bash
+usiscm-ingest watch --once --reprocess --package 26092 --estimate-folder "Y:\Estimates\26092"
+```
+
+If `Y:\Estimates\26092` does not exist, the copy is skipped and nothing is created under `Y:\Estimates`.
+
+A one-folder import (no watch state) does the same split:
+
+```bash
+usiscm-ingest import "C:\Users\CharlesDossett\DC\ACCDocs\<hub>\26092" --project-id <job-uuid>
+```
+
+Reprocess uploads new sheet rows. It does not delete catalog rows already on the Drawings page. After `26092` finishes, remove the old whole-file drawing rows (and any addendum, W-9, or spec that landed there) in CM. What remains on Drawings should be one row per sheet. New non-drawings are on Documents.
+
+State for that package lives at `C:\Users\CharlesDossett\DC\USISCM-ingest\processed\<hub>__<project>.state.json`. `--reprocess --package 26092` ignores the "already imported" marks for that package only.
 
 ## Review issues on the website
 

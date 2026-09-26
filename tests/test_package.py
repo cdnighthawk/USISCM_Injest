@@ -154,6 +154,39 @@ def test_watch_ingests_new_addenda_without_reuploading_old_files(tmp_path: Path,
     assert project.exists()
 
 
+def test_watch_reprocess_can_target_one_package(tmp_path: Path, monkeypatch) -> None:
+    accdocs = tmp_path / "ACCDocs"
+    _write(accdocs / "Account" / "26092" / "Drawings" / "A-101.pdf")
+    _write(accdocs / "Account" / "99999" / "Drawings" / "A-201.pdf")
+    state = tmp_path / "USISCM-ingest"
+    monkeypatch.setenv("USISCM_WATCH_DIR", str(accdocs))
+    monkeypatch.setenv("USISCM_PROCESSED_DIR", str(state / "processed"))
+    monkeypatch.setenv("USISCM_FAILED_DIR", str(state / "failed"))
+    monkeypatch.setenv("USISCM_SETTLE_SECONDS", "0")
+
+    class FakeClient:
+        calls: list[str] = []
+
+        def import_package(self, manifest, project_id=None, dry_run=False):
+            FakeClient.calls.append(manifest.label)
+            return UploadResult(project_id=project_id or 1, imported=len(manifest.files))
+
+    monkeypatch.setattr("usiscm_ingest.cli._client", lambda settings: FakeClient())
+    assert main(["watch", "--once", "--reprocess", "--package", "26092"]) == 0
+    assert FakeClient.calls == ["26092"]
+
+
+def test_watch_package_filter_miss_is_an_error(tmp_path: Path, monkeypatch, caplog) -> None:
+    accdocs = tmp_path / "ACCDocs"
+    _write(accdocs / "Account" / "26092" / "A-101.pdf")
+    monkeypatch.setenv("USISCM_WATCH_DIR", str(accdocs))
+    monkeypatch.setenv("USISCM_PROCESSED_DIR", str(tmp_path / "processed"))
+    monkeypatch.setenv("USISCM_FAILED_DIR", str(tmp_path / "failed"))
+    with caplog.at_level("ERROR"):
+        assert main(["watch", "--once", "--dry-run", "--package", "missing-job"]) == 2
+    assert "matched" in caplog.text
+
+
 def test_watch_missing_accdocs_errors(tmp_path: Path, monkeypatch, caplog) -> None:
     missing = tmp_path / "no-such-accdocs"
     monkeypatch.setenv("USISCM_WATCH_DIR", str(missing))

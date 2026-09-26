@@ -394,6 +394,197 @@ def test_ingest_key_document_duplicate_skips_b2(tmp_path: Path) -> None:
     assert result.details[0]["document_id"] == "doc-kept"
 
 
+def _write_pdf(path: Path, pages: list[tuple[str, str, str]]) -> None:
+    import pymupdf
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = pymupdf.open()
+    try:
+        for kind, number, title in pages:
+            page = doc.new_page(width=612, height=792)
+            if kind == "drawing":
+                page.insert_text((72, 72), title)
+                page.insert_text((72, 96), f"SHEET NO. {number}")
+                page.insert_text((72, 120), f"SHEET TITLE: {title}")
+            elif kind == "addendum":
+                page.insert_text((72, 72), f"ADDENDUM NO. {number}")
+                page.insert_text((72, 96), "This addendum modifies the bid.")
+            else:
+                page.insert_text((72, 72), title)
+        doc.save(path)
+    finally:
+        doc.close()
+
+
+def _pdf_pages(payload: bytes) -> int:
+    import pymupdf
+
+    try:
+        doc = pymupdf.open(stream=payload, filetype="pdf")
+    except Exception:
+        return 0
+    try:
+        return int(doc.page_count)
+    finally:
+        doc.close()
+
+
+def test_multipage_drawing_is_split_before_native_b2(tmp_path: Path) -> None:
+    job = tmp_path / "Job"
+    _write_pdf(
+        job / "Drawings" / "Architectural.pdf",
+        [
+            ("drawing", "A-101", "FLOOR PLAN"),
+            ("drawing", "S-201", "FOUNDATION PLAN"),
+            ("addendum", "4", ""),
+        ],
+    )
+    _write_pdf(
+        job / "Combined Bid Set.pdf",
+        [("plain", "", "BID FORM"), ("plain", "", "INSTRUCTIONS TO BIDDERS")],
+    )
+    (job / "Addendum No.4.pdf").write_bytes(b"%PDF-addendum")
+    (job / "W9.pdf").write_bytes(b"%PDF-w9")
+    manifest = ingest_source(job)
+    assert FileCategory.DRAWING in {item.category for item in manifest.files}
+    assert all(item.category != FileCategory.DRAWING for item in manifest.files if item.path.name != "Architectural.pdf")
+
+    drawing_bodies: list[dict] = []
+    document_names: list[str] = []
+    b2_payloads: list[bytes] = []
+    ids = {"n": 0}
+
+    def fake_b2(hint, payload, **kwargs):
+        b2_payloads.append(payload)
+        return {"fileId": "fid", "fileName": hint.get("file_name"), "contentSha1": "abc"}
+
+    def fake_post(url, **kwargs):
+        assert "files" not in kwargs
+        response = MagicMock()
+        response.ok = True
+        response.headers = {}
+        response.status_code = 201
+        ids["n"] += 1
+        if "/jobs/" in url and url.endswith("/drawings"):
+            item = (kwargs.get("json") or {}).get("item") or {}
+            drawing_bodies.append(item)
+            response.json.return_value = {
+                "item": {"id": f"draw-{ids['n']}"},
+                "upload": _native_upload(f"drawings/{item.get('sourceFileName')}"),
+            }
+        elif "/jobs/" in url and url.endswith("/documents"):
+            item = (kwargs.get("json") or {}).get("item") or {}
+            document_names.append(item.get("sourceFileName") or "")
+            response.json.return_value = {
+                "item": {"id": f"doc-{ids['n']}"},
+                "upload": _native_upload(f"documents/{item.get('sourceFileName')}"),
+            }
+        elif url.endswith("/ack-file"):
+            response.status_code = 200
+            response.json.return_value = {"item": {"file_pending": False}}
+        else:
+            response.status_code = 200
+            response.json.return_value = {"item": {}}
+        return response
+
+    estimate = tmp_path / "26092"
+    estimate.mkdir()
+    missing = tmp_path / "Estimates" / "not-created"
+    client = UsiscmClient(
+        Settings(
+            base_url="https://www.usiscm.com",
+            ms_access_token="ms-token",
+            token_path=tmp_path / "ms.json",
+            sheet_ai=False,
+        ),
+        sleeper=lambda _: None,
+        b2_post=fake_b2,
+    )
+    client.token = "ms-token"
+    client.auth_mode = "microsoft"
+    client.resolve_project = MagicMock(  # type: ignore[method-assign]
+        return_value={"id": "job-uuid", "name": "Job", "kind": "job", "job_id": "job-uuid"}
+    )
+    client.session.post = MagicMock(side_effect=fake_post)
+
+    result = client.import_package(manifest, project_id="job-uuid", estimate_folder=str(estimate))
+    assert result.errors == []
+    assert [body["sheetNumber"] for body in drawing_bodies] == ["A-101", "S-201"]
+    assert all(body["sourceFileName"] != "Architectural.pdf" for body in drawing_bodies)
+    assert [_pdf_pages(payload) for payload in b2_payloads[:2]] == [1, 1]
+    assert any(_pdf_pages(payload) == 2 for payload in b2_payloads)
+    assert "Architectural.pdf" not in document_names
+    assert "Addendum No.4.pdf" in document_names
+    assert "W9.pdf" in document_names
+    assert "Combined Bid Set.pdf" in document_names
+    combined = next(payload for payload in b2_payloads if _pdf_pages(payload) == 2)
+    assert combined
+    urls = [call.args[0] for call in client.session.post.call_args_list]
+    assert any(url.endswith("/api/v1/jobs/job-uuid/drawings") for url in urls)
+    assert any(url.endswith("/documents") for url in urls)
+    assert not any(url.rstrip("/").endswith("/api/drawings") for url in urls)
+    copied = list((estimate / "02_Processed" / "drawings").glob("*.pdf"))
+    assert {path.name for path in copied} == {body["sourceFileName"] for body in drawing_bodies}
+    assert not missing.exists()
+    assert result.imported == 2 + len(document_names)
+
+
+def test_ingest_key_uploads_split_sheets_with_split_pages_false(tmp_path: Path) -> None:
+    job = tmp_path / "Job"
+    _write_pdf(
+        job / "Drawings" / "Architectural.pdf",
+        [("drawing", "A-101", "FLOOR PLAN"), ("drawing", "S-201", "FOUNDATION PLAN")],
+    )
+    manifest = ingest_source(job)
+    bodies: list[dict] = []
+    payloads: list[bytes] = []
+
+    def fake_post(url, **kwargs):
+        assert "files" not in kwargs
+        response = MagicMock()
+        response.ok = True
+        response.headers = {}
+        response.status_code = 201
+        if url.rstrip("/").endswith("/api/drawings"):
+            meta = kwargs.get("json") or {}
+            bodies.append(meta)
+            assert meta["split_pages"] is False
+            response.json.return_value = {
+                "drawing": {"id": f"draw-{len(bodies)}"},
+                "upload": _native_upload(f"drawings/{meta.get('filename')}"),
+            }
+        elif url.endswith("/ack-file"):
+            response.status_code = 200
+            response.json.return_value = {"item": {"file_pending": False}}
+        else:
+            response.status_code = 200
+            response.json.return_value = {"item": {}}
+        return response
+
+    client = UsiscmClient(
+        Settings(
+            base_url="https://www.usiscm.com",
+            ingest_api_key="night-key",
+            token_path=tmp_path / "ms.json",
+            sheet_ai=False,
+        ),
+        sleeper=lambda _: None,
+        b2_post=lambda hint, payload, **k: payloads.append(payload) or {"fileId": "fid", "fileName": hint.get("file_name")},
+    )
+    client.token = "night-key"
+    client.auth_mode = "ingest_key"
+    client.resolve_project = MagicMock(return_value={"id": "job-1", "name": "Job"})  # type: ignore[method-assign]
+    client.session.post = MagicMock(side_effect=fake_post)
+
+    result = client.import_package(manifest, project_id="job-1")
+    assert result.errors == []
+    assert result.imported == 2
+    assert [body["sheet_number"] for body in bodies] == ["A-101", "S-201"]
+    assert all(body["split_pages"] is False for body in bodies)
+    assert [ _pdf_pages(payload) for payload in payloads ] == [1, 1]
+    assert all(body["filename"] != "Architectural.pdf" for body in bodies)
+
+
 def test_content_type_for_office_files() -> None:
     from usiscm_ingest.client import content_type_for
 

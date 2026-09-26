@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "usiscm-ingest"
-version = "0.2.0"
+version = "0.3.0"
 description = "Watch downloaded files, auto-name drawings, and ingest them into USISCM + Backblaze B2"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -13,6 +13,7 @@ dependencies = [
     "requests>=2.31.0",
     "python-dotenv>=1.0.0",
     "pyyaml>=6.0",
+    "pymupdf>=1.24.0",
 ]
 
 [project.optional-dependencies]

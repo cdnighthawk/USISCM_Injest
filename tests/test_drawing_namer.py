@@ -81,6 +81,40 @@ def test_apply_ai_identity_overrides_when_confident() -> None:
     assert updated.discipline == "Architectural"
 
 
+def test_junk_filename_tokens_are_not_sheet_numbers() -> None:
+    from usiscm_ingest.drawing_namer import is_junk_sheet_token
+
+    for name in ("Addendum No.4.pdf", "ADD01.pdf", "PKG1.pdf", "W9.pdf", "W-9.pdf", "Form W9.pdf"):
+        got = parse_filename(name)
+        assert got["sheet_number"] is None, (name, got)
+        named = name_drawing(filename=name)
+        assert named.sheet_number is None, name
+    for token in ("NO.4", "ADD01", "PKG1", "W9", "W-9"):
+        assert is_junk_sheet_token(token)
+        assert not is_sheet_number(token)
+
+
+def test_real_sheet_numbers_still_parse() -> None:
+    assert parse_filename("A-101 Floor Plan.pdf")["sheet_number"] == "A-101"
+    assert is_sheet_number("P3-G0.1.01")
+    assert is_sheet_number("S2.01")
+
+
+def test_page_text_names_sheet_after_split_ignores_parent_filename() -> None:
+    text = "FLOOR PLAN\nLEVEL 1\nSHEET NO. A-101\nSHEET TITLE: FLOOR PLAN\nSCALE: 1/8\" = 1'-0\""
+    named = name_drawing(
+        filename="PKG1_Drawings.pdf",
+        page_text=text,
+        use_filename_sheet=False,
+        use_filename_title=False,
+    )
+    assert named.sheet_number == "A-101"
+    assert named.sheet_title == "FLOOR PLAN"
+    assert named.discipline == "Architectural"
+    assert named.needs_review is False
+    assert "PKG1" not in (named.sheet_number or "")
+
+
 def test_apply_ai_identity_flags_garbage_sheet_number() -> None:
     named = name_drawing(filename="A-101 Floor Plan.pdf")
     updated = apply_ai_identity(

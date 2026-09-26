@@ -2,17 +2,21 @@
 
 Drawings and other documents follow the USISPdfApp path: catalog row on the
 website, file bytes straight to native B2, then a metadata-only ack.
-Render never receives the file. Automatic drawing names never wait for a
-person; ambiguous names still upload and are logged on
-``/api/v1/ingest/errors`` so they show up in the CM ingest tracker.
+Render never receives the file. Multi-page drawing PDFs are split on this
+machine into one PDF per sheet before that upload. Specs, addenda, bid forms,
+W-9s, manuals, and combined bid sets stay on the documents path. Automatic
+drawing names never wait for a person; ambiguous names still upload and are
+logged on ``/api/v1/ingest/errors`` so they show up in the CM ingest tracker.
 """
 
 from __future__ import annotations
 
 import logging
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urljoin
 
@@ -43,6 +47,12 @@ from usiscm_ingest.microsoft import (
     resolve_access_token,
 )
 from usiscm_ingest.package import PackageManifest
+from usiscm_ingest.pdf_split import (
+    PdfSplitError,
+    dual_write_sheet,
+    expand_drawing_file,
+    resolve_estimate_folder,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -254,61 +264,50 @@ class UsiscmClient:
         project_id: str | None = None,
         dry_run: bool = False,
         batch_id: str | None = None,
+        estimate_folder: str | None = None,
     ) -> UploadResult:
         project = self.resolve_project(project_id=project_id, project_name=manifest.label)
         resolved_id = str(project.get("id") or project.get("project_id") or project_id or "")
         result = UploadResult(project_id=resolved_id, batch_id=batch_id or uuid.uuid4().hex[:16])
-        if dry_run:
-            named = []
-            for item in manifest.files_for(FileCategory.DRAWING):
-                named.append(name_drawing(filename=item.path.name, folder_path=item.relative_path).to_dict())
-            result.details.append(
-                {
-                    "dry_run": True,
-                    "project": project.get("name") or project.get("project_name"),
-                    "counts": manifest.counts,
-                    "names": named,
-                }
-            )
-            result.imported = len(manifest.files)
-            return result
+        estimate_dir = resolve_estimate_folder(project, estimate_folder)
+        with tempfile.TemporaryDirectory(prefix="usiscm-sheets-") as tmp:
+            drawings, rerouted = self._expand_drawings(manifest, Path(tmp), result)
+            documents = self._document_items(manifest, result) + rerouted
+            if dry_run:
+                named = [_name_item(item).to_dict() for item in drawings]
+                result.details.append(
+                    {
+                        "dry_run": True,
+                        "project": project.get("name") or project.get("project_name"),
+                        "counts": manifest.counts,
+                        "names": named,
+                        "sheet_count": len(drawings),
+                        "document_count": len(documents),
+                    }
+                )
+                for detail in result.details:
+                    if detail.get("error"):
+                        result.errors.append({"filename": detail.get("filename"), "error": detail["error"]})
+                result.imported = len(drawings) + len(documents)
+                return result
 
-        stored: list[tuple[str, dict[str, Any]]] = []
-        drawings = [
-            item
-            for item in manifest.files_for(FileCategory.DRAWING)
-            if item.path.suffix.lower() in DRAWING_EXTENSIONS
-        ]
-        for item in drawings:
-            detail = self._upload_drawing(project, item, manifest.label, batch_id=result.batch_id)
-            result.details.append(detail)
-            stored.append((str(item.path), detail))
+            stored: list[tuple[str, dict[str, Any]]] = []
+            for item in drawings:
+                if estimate_dir is not None:
+                    try:
+                        dual_write_sheet(estimate_dir, item.path, item.path.name)
+                    except OSError as exc:
+                        logger.warning("sheet copy skipped for %s: %s", item.path.name, exc)
+                detail = self._upload_drawing(project, item, manifest.label, batch_id=result.batch_id)
+                result.details.append(detail)
+                stored.append((item.origin_path or str(item.path), detail))
 
-        for category in (
-            FileCategory.SPEC,
-            FileCategory.BID_INSTRUCTIONS,
-            FileCategory.ADDENDA,
-            FileCategory.REPORT,
-            FileCategory.SCHEDULE,
-            FileCategory.OTHER,
-        ):
-            docs = [
-                item
-                for item in manifest.files_for(category)
-                if item.path.suffix.lower() in DOCUMENT_EXTENSIONS
-            ]
-            skipped = [
-                item
-                for item in manifest.files_for(category)
-                if item.path.suffix.lower() not in DOCUMENT_EXTENSIONS
-            ]
-            result.skipped += len(skipped)
-            for item in docs:
+            for item in documents:
                 detail = self._upload_document(
-                    project, item, category, manifest.label, batch_id=result.batch_id
+                    project, item, item.category, manifest.label, batch_id=result.batch_id
                 )
                 result.details.append(detail)
-                stored.append((str(item.path), detail))
+                stored.append((item.origin_path or str(item.path), detail))
 
         for detail in result.details:
             result.imported += int(detail.get("imported") or 0)
@@ -320,6 +319,55 @@ class UsiscmClient:
         # One specialty-takeoff job per clean batch. Queue errors stay in the log.
         self._enqueue_specialty_takeoff(result, project, manifest, stored)
         return result
+
+    def _expand_drawings(
+        self,
+        manifest: PackageManifest,
+        dest: Path,
+        result: UploadResult,
+    ) -> tuple[list, list]:
+        """Split drawing PDFs. Non-sheet pages come back on the document list."""
+        drawings = []
+        rerouted = []
+        for item in manifest.files_for(FileCategory.DRAWING):
+            if item.path.suffix.lower() not in DRAWING_EXTENSIONS:
+                continue
+            try:
+                sheets = expand_drawing_file(item, dest)
+            except PdfSplitError as exc:
+                logger.error("%s", exc)
+                result.details.append(
+                    {
+                        "endpoint": "b2-native" if self.uses_microsoft else "ingest/drawings",
+                        "filename": item.path.name,
+                        "imported": 0,
+                        "error": str(exc),
+                    }
+                )
+                continue
+            for sheet in sheets:
+                if sheet.category == FileCategory.DRAWING:
+                    drawings.append(sheet)
+                else:
+                    rerouted.append(sheet)
+        return drawings, rerouted
+
+    def _document_items(self, manifest: PackageManifest, result: UploadResult) -> list:
+        documents = []
+        for category in (
+            FileCategory.SPEC,
+            FileCategory.BID_INSTRUCTIONS,
+            FileCategory.ADDENDA,
+            FileCategory.REPORT,
+            FileCategory.SCHEDULE,
+            FileCategory.OTHER,
+        ):
+            for item in manifest.files_for(category):
+                if item.path.suffix.lower() in DOCUMENT_EXTENSIONS:
+                    documents.append(item)
+                else:
+                    result.skipped += 1
+        return documents
 
     def _enqueue_specialty_takeoff(
         self,
@@ -407,11 +455,7 @@ class UsiscmClient:
 
     def _upload_drawing(self, project: dict[str, Any], item, label: str, *, batch_id: str) -> dict[str, Any]:
         self._ensure_auth()
-        named = name_drawing(
-            filename=item.path.name,
-            folder_path=item.relative_path,
-            sheet_number=item.sheet_number,
-        )
+        named = _name_item(item)
         named = self._maybe_ai_name(item.path, named)
         project_id = str(project.get("id") or project.get("project_id") or "")
         project_number = _project_number(project)
@@ -668,6 +712,7 @@ class UsiscmClient:
             "discipline": named.discipline,
             "drawing_set": named.drawing_set or label,
             "revision": named.revision,
+            # Already one PDF per sheet on this machine. The website must not split again.
             "split_pages": False,
             "source": ISSUE_SOURCE,
             "sourceSystem": ISSUE_SOURCE,
@@ -869,6 +914,18 @@ class UsiscmClient:
 
     def _url(self, path: str) -> str:
         return urljoin(self.base_url, path.lstrip("/"))
+
+
+def _name_item(item) -> DrawingName:
+    """Name a sheet from its own text after a split, otherwise from the filename."""
+    return name_drawing(
+        filename=item.path.name,
+        folder_path=item.relative_path,
+        sheet_number=getattr(item, "sheet_number", None),
+        page_text=getattr(item, "page_text", None),
+        use_filename_sheet=not getattr(item, "from_split", False),
+        use_filename_title=not getattr(item, "from_split", False),
+    )
 
 
 def content_type_for(suffix: str) -> str:

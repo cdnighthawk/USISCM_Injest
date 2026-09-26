@@ -14,15 +14,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable
 
-# Architectural / MEP sheet numbers appear across almost every office's set,
-# regardless of how they name the parent folder or zip.
-# Examples: A-101, A101, S2.01, M-001, E201, FA-101, P001, I-0.01
-SHEET_NUMBER_RE = re.compile(
-    r"(?<![A-Za-z0-9])"
-    r"(?:[A-Z]{1,3}[-.]?\d{1,4}(?:[.-]\d{1,3})?)"
-    r"(?![A-Za-z0-9])",
-    re.IGNORECASE,
-)
+from usiscm_ingest.drawing_namer import find_sheet_number
+
+# Real sheet ids (A-101, S2.01, G0.1.01) come from find_sheet_number.
+# ADD01, PKG1, NO.4, and W9 are not sheet numbers.
 
 CSI_SECTION_RE = re.compile(r"\b\d{2}\s+\d{2}\s+\d{2}\b")
 
@@ -173,6 +168,14 @@ DEFAULT_HINTS: dict[FileCategory, CategoryHints] = {
             "prebid",
             "pre-bid",
             "bid package",
+            "bid set",
+            "combined bid",
+            "combined set",
+            "rfp",
+            "rfq",
+            "request for proposal",
+            "w9",
+            "w 9",
             "division 00",
             "div 00",
         ),
@@ -246,6 +249,9 @@ class ClassifiedFile:
     reasons: list[str] = field(default_factory=list)
     sheet_number: str | None = None
     size_bytes: int = 0
+    page_text: str | None = None
+    from_split: bool = False
+    origin_path: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -271,6 +277,51 @@ def should_skip(path: Path) -> bool:
 
 def _normalize(text: str) -> str:
     return re.sub(r"[_\-]+", " ", text).lower()
+
+
+# These names are documents even if a sheet-like token sits nearby
+# (Addendum No.4, W-9, Combined Bid Set) or the file sits in a Drawings folder.
+_HARD_DOCUMENT_NAME_RE = re.compile(
+    r"("
+    r"\baddend(?:um|a)\b"
+    r"|\bbulletins?\b"
+    r"|\bproject\s+manual\b"
+    r"|\bw[-\s]?9\b"
+    r"|\bform\s+w[-\s]?9\b"
+    r"|\brfp\b"
+    r"|\brfq\b"
+    r"|\brequest\s+for\s+proposal\b"
+    r"|\bbid\s+forms?\b"
+    r"|\binstructions?\s+to\s+bidders\b"
+    r"|\binvitation\s+to\s+bid\b"
+    r"|\bbid\s+sets?\b"
+    r"|\bcombined\s+bids?\b"
+    r"|\bcombined\s+sets?\b"
+    r"|\bbid\s+packages?\b"
+    r"|\bcontract\s+documents\b"
+    r"|\b(?:o\s*&\s*m|operation\s+and\s+maintenance)\b"
+    r"|\bmanuals?\b"
+    r")",
+    re.IGNORECASE,
+)
+# Spec books without a real sheet id. "A-101 Wall Specifications" stays a drawing.
+_SPEC_BOOK_NAME_RE = re.compile(
+    r"\bspecifications?\b|\bspec\s*book\b|\btechnical\s+specs?\b",
+    re.IGNORECASE,
+)
+
+
+def is_non_drawing_filename(filename: str | None) -> bool:
+    """True for specs, addenda, bid forms, W-9, RFP, manuals, and combined bid sets."""
+    stem = Path(filename or "").stem
+    if not stem:
+        return False
+    blob = f"{stem}\n{_normalize(stem)}"
+    if _HARD_DOCUMENT_NAME_RE.search(blob):
+        return True
+    if _SPEC_BOOK_NAME_RE.search(blob) and not find_sheet_number(stem):
+        return True
+    return False
 
 
 def _count_hits(haystack: str, needles: Iterable[str]) -> list[str]:
@@ -381,8 +432,8 @@ def classify_file(
     folder_blob = _folder_text(relative)
     name_blob = _normalize(path.stem)
     suffix = path.suffix.lower()
-    sheet_match = SHEET_NUMBER_RE.search(path.stem)
-    sheet_hit = sheet_match.group(0).upper() if sheet_match else None
+    non_drawing_name = is_non_drawing_filename(path.name)
+    sheet_hit = None if non_drawing_name else find_sheet_number(path.stem)
     csi_hit = bool(CSI_SECTION_RE.search(path.stem) or CSI_SECTION_RE.search(name_blob))
     text_blob = _peek_pdf_text(path) if peek_pdf else ""
 
@@ -391,6 +442,8 @@ def classify_file(
     best_reasons: list[str] = []
 
     for category, category_hints in hint_map.items():
+        if non_drawing_name and category == FileCategory.DRAWING:
+            continue
         score, reasons = _score_category(
             category,
             category_hints,
@@ -406,16 +459,19 @@ def classify_file(
             best_category = category
             best_reasons = reasons
 
-    # Sheet numbers identify drawings even when the file sits in a Bid / ITB
-    # folder (GCs often dump the entire set there).
-    if sheet_hit and suffix in DRAWING_EXTENSIONS:
+    # Real sheet numbers identify drawings even when the file sits in a Bid / ITB
+    # folder (GCs often dump the entire set there). Addenda, specs, W-9, RFP,
+    # manuals, and combined bid sets never take this path.
+    if sheet_hit and suffix in DRAWING_EXTENSIONS and not non_drawing_name:
         if best_category != FileCategory.DRAWING or best_score < 5:
             best_category = FileCategory.DRAWING
             best_score = max(best_score, 6)
             if f"sheet number {sheet_hit}" not in best_reasons:
                 best_reasons = [f"sheet number {sheet_hit}", *best_reasons]
 
-    if best_score == 0 and suffix not in DRAWING_EXTENSIONS | DOCUMENT_EXTENSIONS | {".mpp", ".xer"}:
+    if best_score == 0 and non_drawing_name:
+        best_reasons = ["non-drawing document (addendum, spec, bid set, W-9, RFP, or manual)"]
+    elif best_score == 0 and suffix not in DRAWING_EXTENSIONS | DOCUMENT_EXTENSIONS | {".mpp", ".xer"}:
         best_reasons = ["unrecognized file type"]
     elif best_score == 0:
         best_reasons = ["no category signals"]
