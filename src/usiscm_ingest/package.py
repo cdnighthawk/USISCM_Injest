@@ -190,6 +190,22 @@ def _looks_like_acc_hub(path: Path) -> bool:
     return bool(children) and all(child.is_dir() for child in children)
 
 
+def package_matches(package: Path, needles: list[str] | None) -> bool:
+    """True when ``package`` is one of the requested jobs (for example ``26092``)."""
+    if not needles:
+        return True
+    name = package.name.lower()
+    parts = [part.lower() for part in package.parts]
+    blob = str(package).replace("\\", "/").lower()
+    for needle in needles:
+        n = needle.strip().lower()
+        if not n:
+            continue
+        if n == name or n in parts or n in name or f"/{n}/" in f"/{blob}/" or blob.endswith("/" + n):
+            return True
+    return False
+
+
 def package_state_key(drop: Path, package: Path) -> str:
     """Stable sidecar filename for a package relative to the ACCDocs root."""
     try:

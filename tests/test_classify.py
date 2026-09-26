@@ -89,6 +89,48 @@ def test_drawing_in_bid_folder_stays_a_drawing(tmp_path: Path) -> None:
     assert result.category == FileCategory.DRAWING
 
 
+def test_addendum_no_4_is_not_a_drawing(tmp_path: Path) -> None:
+    path = _touch(tmp_path / "Drawings" / "Addendum No.4.pdf")
+    result = classify_file(path, root=tmp_path)
+    assert result is not None
+    assert result.category == FileCategory.ADDENDA
+    assert result.sheet_number is None
+
+
+def test_sheet_titled_specifications_stays_a_drawing(tmp_path: Path) -> None:
+    path = _touch(tmp_path / "A-101 Wall Specifications.pdf")
+    result = classify_file(path, root=tmp_path)
+    assert result is not None
+    assert result.category == FileCategory.DRAWING
+    assert result.sheet_number == "A-101"
+
+
+def test_combined_bid_set_in_drawings_folder_stays_a_document(tmp_path: Path) -> None:
+    path = _touch(tmp_path / "Drawings" / "Combined Bid Set.pdf")
+    result = classify_file(path, root=tmp_path)
+    assert result is not None
+    assert result.category == FileCategory.BID_INSTRUCTIONS
+    assert result.sheet_number is None
+
+
+def test_w9_rfp_and_combined_bid_set_are_not_drawings(tmp_path: Path) -> None:
+    cases = {
+        "W9.pdf": FileCategory.BID_INSTRUCTIONS,
+        "W-9.pdf": FileCategory.BID_INSTRUCTIONS,
+        "RFP.pdf": FileCategory.BID_INSTRUCTIONS,
+        "Combined Bid Set.pdf": FileCategory.BID_INSTRUCTIONS,
+        "PKG1.pdf": FileCategory.OTHER,
+        "Project Specifications.pdf": FileCategory.SPEC,
+    }
+    for name, category in cases.items():
+        path = _touch(tmp_path / name)
+        result = classify_file(path, root=tmp_path)
+        assert result is not None, name
+        assert result.category == category, (name, result.category, result.reasons)
+        assert result.category != FileCategory.DRAWING
+        assert result.sheet_number is None
+
+
 def test_macos_junk_is_skipped(tmp_path: Path) -> None:
     path = _touch(tmp_path / "__MACOSX" / "._A-101.pdf")
     assert classify_file(path, root=tmp_path) is None

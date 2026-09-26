@@ -20,7 +20,13 @@ from usiscm_ingest.microsoft import (
     device_code_login,
     save_tokens,
 )
-from usiscm_ingest.package import ingest_source, iter_packages, package_state_key, stamp_name
+from usiscm_ingest.package import (
+    ingest_source,
+    iter_packages,
+    package_matches,
+    package_state_key,
+    stamp_name,
+)
 from usiscm_ingest.state import PackageState, pending_manifest, scan_changes, seed_from_legacy_manifest
 
 logger = logging.getLogger("usiscm_ingest")
@@ -59,6 +65,14 @@ def main(argv: list[str] | None = None) -> int:
     import_cmd.add_argument("--peek-pdf", action="store_true")
     import_cmd.add_argument("--work-dir", type=Path)
     import_cmd.add_argument("--json", dest="json_out", type=Path)
+    import_cmd.add_argument(
+        "--estimate-folder",
+        help=(
+            "Existing CM estimate folder for this job. Split sheets are also copied to "
+            "folder\\02_Processed\\drawings. The folder must already exist; "
+            "Y:\\Estimates roots are not created."
+        ),
+    )
 
     watch = sub.add_parser("watch", help="Poll ACCDocs (or another drop folder) and ingest new files")
     watch.add_argument(
@@ -80,7 +94,20 @@ def main(argv: list[str] | None = None) -> int:
     watch.add_argument(
         "--reprocess",
         action="store_true",
-        help="Re-import every file, even if it has not changed",
+        help="Re-import every selected file, even if it has not changed",
+    )
+    watch.add_argument(
+        "--package",
+        action="append",
+        dest="packages",
+        help="Only this package (folder name or path fragment such as 26092). Repeatable.",
+    )
+    watch.add_argument(
+        "--estimate-folder",
+        help=(
+            "Existing CM estimate folder. Split sheets are also copied to "
+            "folder\\02_Processed\\drawings. Must already exist."
+        ),
     )
 
     specialty = sub.add_parser(
@@ -218,6 +245,7 @@ def _cmd_import(args: argparse.Namespace) -> int:
             manifest,
             project_id=args.project_id,
             dry_run=args.dry_run,
+            **_estimate_kwargs(args),
         )
     except UsiscmError as exc:
         logger.error("%s", exc)
@@ -252,7 +280,11 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
     def run_once() -> int:
         status = 0
-        for package in iter_packages(drop):
+        packages = [package for package in iter_packages(drop) if package_matches(package, args.packages)]
+        if args.packages and not packages:
+            logger.error("No package under %s matched %s", drop, ", ".join(args.packages))
+            return 2
+        for package in packages:
             logger.info("Scanning %s", package)
             manifest = ingest_source(package, work_dir=settings.work_dir, peek_pdf=args.peek_pdf)
             if manifest.errors:
@@ -298,6 +330,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
                     pending,
                     project_id=args.project_id,
                     dry_run=False,
+                    **_estimate_kwargs(args),
                 )
                 print(json.dumps(result.to_dict(), indent=2))
                 if result.errors:
@@ -399,6 +432,13 @@ def _specialty_pass(scripts: Any, max_jobs: int | None) -> int:
 
 def _client(settings) -> UsiscmClient:
     return UsiscmClient(settings)
+
+
+def _estimate_kwargs(args: argparse.Namespace) -> dict[str, str]:
+    folder = getattr(args, "estimate_folder", None)
+    if folder:
+        return {"estimate_folder": folder}
+    return {}
 
 
 def _print_manifest(manifest) -> None:

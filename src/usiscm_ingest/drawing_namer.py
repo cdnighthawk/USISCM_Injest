@@ -1,9 +1,11 @@
 """Automatic drawing names — the desktop namer without a person at the keyboard.
 
 Mirrors USISPdfApp / CM_Deploy ``drawing_label`` + hygiene so sheet numbers,
-titles, discipline, set, and revision come from the filename and folder path
-instead of a review dialog. Ambiguous names still ingest; they are flagged
-for the website ingest-error queue.
+titles, discipline, set, and revision come from the sheet itself (title-block
+text after a page split) and, for an already-single sheet, the filename and
+folder. Ambiguous names still ingest; they are flagged for the website
+ingest-error queue. Package and form tokens (PKG1, ADD01, NO.4, W9) are not
+sheet numbers.
 """
 
 from __future__ import annotations
@@ -25,12 +27,54 @@ _SHEET_NUM_RE = re.compile(
     r"^(?:[A-Z]{1,3}\d{0,2}-)?[A-Z]{1,3}[-\s.]?\d{1,4}(?:[.\-]\d{1,4}){0,3}(?:-[A-Z0-9]{1,3})?[A-Z]?$",
     re.IGNORECASE,
 )
-_LEADING_SHEET = re.compile(r"^[A-Z]{1,3}[-\s.]?\d", re.IGNORECASE)
 _REV = re.compile(r"(?:^|[_-])rev(?:ision)?[-_]?([A-Z0-9.]+)", re.IGNORECASE)
 _PAGE_RE = re.compile(r"^(?:page|sheet|pg)[\s._-]*\d+$", re.IGNORECASE)
 _IMG_RE = re.compile(r"^(img|image|dsc|scan)[_-]?\d+", re.IGNORECASE)
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+# Tokens that look like sheet ids but come from package names, addenda, and forms.
+# ADD01, PKG1, NO.4, and W9 must not become drawing numbers.
+_JUNK_SHEET_PREFIXES = {
+    "ADD",
+    "ADDM",
+    "ASI",
+    "BID",
+    "DIV",
+    "DOC",
+    "FORM",
+    "ITB",
+    "NO",
+    "PK",
+    "PKG",
+    "RFP",
+    "RFQ",
+    "SEC",
+    "SPEC",
+    "VOL",
+}
+
+_SHEET_FIND_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"((?:[A-Z]{1,3}\d{0,2}-)?[A-Z]{1,3}[-\s.]?\d{1,4}(?:[.\-]\d{1,4}){0,3}(?:-[A-Z0-9]{1,3})?[A-Z]?)"
+    r"(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+_LABELED_SHEET_RE = re.compile(
+    r"(?:sheet|drawing|dwg)\.?\s*(?:no\.?|number|#)\s*[:\-]?\s*"
+    r"([A-Z]{1,3}(?:\d{0,2}-)?[A-Z]{0,3}[-.\s]?\d{1,4}(?:[.\-]\d{1,4}){0,3}(?:-[A-Z0-9]{1,3})?[A-Z]?)",
+    re.IGNORECASE,
+)
+_LABELED_TITLE_RE = re.compile(
+    r"(?:sheet\s*title|drawing\s*title)\s*[:\-]\s*([^\n\r]{2,160})",
+    re.IGNORECASE,
+)
+_TITLE_NOISE_RE = re.compile(
+    r"^(?:scale|date|drawn|checked|check|project|revision|rev\.?|sheet|drawing|dwg|"
+    r"no\.?|north|copyright|not for construction|plot|file|job|consultant|"
+    r"architect|engineer|stamp|seal)\b",
     re.IGNORECASE,
 )
 
@@ -108,11 +152,45 @@ class DrawingName:
         return "automatic drawing name needs review"
 
 
+def _leading_sheet_letters(token: str) -> str:
+    raw = re.sub(r"[^A-Z0-9.\-]", "", (token or "").upper())
+    package = re.match(r"^P\d+-", raw)
+    if package:
+        raw = raw[package.end() :]
+    match = re.match(r"^([A-Z]+)", raw)
+    return match.group(1) if match else ""
+
+
+def is_junk_sheet_token(raw: str | None) -> bool:
+    """Package, addendum, and form tokens that must not be stored as sheet numbers."""
+    token = (raw or "").strip()
+    if not token:
+        return False
+    compact = re.sub(r"[^A-Z0-9]", "", token.upper())
+    if compact in {"W9", "W9FORM", "FW9"}:
+        return True
+    if re.fullmatch(r"W[-.\s]?9", token, re.IGNORECASE):
+        return True
+    return _leading_sheet_letters(token) in _JUNK_SHEET_PREFIXES
+
+
 def is_sheet_number(raw: str | None) -> bool:
     token = (raw or "").strip()
     if not token or _PAGE_RE.match(token):
         return False
+    if is_junk_sheet_token(token):
+        return False
     return bool(_SHEET_NUM_RE.match(token))
+
+
+def find_sheet_number(text: str | None) -> str | None:
+    """First real sheet id in ``text``. Skips ADD01, PKG1, NO.4, W9, and similar."""
+    raw = text or ""
+    for match in _SHEET_FIND_RE.finditer(raw):
+        token = normalize_sheet_number(match.group(1))
+        if token and is_sheet_number(token):
+            return token
+    return None
 
 
 def normalize_sheet_number(raw: str | None) -> str | None:
@@ -147,21 +225,20 @@ def parse_filename(filename: str | None) -> dict[str, str | None]:
     token = token.strip()
     sheet = None
     title = None
-    if token and _LEADING_SHEET.match(token):
+    if token and is_sheet_number(token):
         sheet = normalize_sheet_number(token)
         if rest:
             title = _title_from_rest(rest)
     if sheet is None:
         compact = stem.replace("_", " ").replace("—", " ")
-        hit = re.search(
-            r"\b((?:[A-Z]{1,3}\d{0,2}-)?[A-Z]{1,3}[-\s.]?\d{1,4}(?:[.\-]\d{1,4}){0,3}(?:-[A-Z0-9]{1,3})?[A-Z]?)\b",
-            compact,
-            re.I,
-        )
-        if hit:
-            sheet = normalize_sheet_number(hit.group(1))
-            leftover = compact.replace(hit.group(1), " ", 1).strip(" -_")
+        for match in _SHEET_FIND_RE.finditer(compact):
+            candidate = normalize_sheet_number(match.group(1))
+            if not candidate or not is_sheet_number(candidate):
+                continue
+            sheet = candidate
+            leftover = f"{compact[: match.start()]} {compact[match.end() :]}".strip(" -_")
             title = leftover[:500] or None
+            break
 
     rev = None
     match = _REV.search(stem)
@@ -268,6 +345,75 @@ def classify_label(sheet_number: str | None, filename: str | None = None) -> dic
     }
 
 
+def _clean_title(raw: str) -> str | None:
+    title = re.sub(r"\s+", " ", raw or "").strip(" \t-_:|")
+    title = re.sub(r"\s+(?:scale|date|rev(?:ision)?)\b.*$", "", title, flags=re.I).strip()
+    if len(title) < 2:
+        return None
+    if is_sheet_number(title) or is_junk_sheet_token(title):
+        return None
+    return title[:500]
+
+
+def _looks_like_title(line: str) -> bool:
+    text = line.strip()
+    if len(text) < 3 or len(text) > 120 or not re.search(r"[A-Za-z]", text):
+        return False
+    if _TITLE_NOISE_RE.match(text) or _PAGE_RE.match(text):
+        return False
+    if is_sheet_number(text) or is_junk_sheet_token(text):
+        return False
+    return True
+
+
+def sheet_number_from_page_text(text: str | None) -> str | None:
+    """Sheet id from one page, preferring a labeled title-block number."""
+    raw = text or ""
+    if not raw.strip():
+        return None
+    labeled: list[str] = []
+    for match in _LABELED_SHEET_RE.finditer(raw):
+        token = normalize_sheet_number(match.group(1))
+        if token and is_sheet_number(token):
+            labeled.append(token)
+    if labeled:
+        return labeled[-1]
+    tail = raw[-2500:]
+    found: list[str] = []
+    for match in _SHEET_FIND_RE.finditer(tail):
+        token = normalize_sheet_number(match.group(1))
+        if token and is_sheet_number(token):
+            found.append(token)
+    if found:
+        return found[-1]
+    return None
+
+
+def identity_from_page_text(text: str | None) -> dict[str, str | None]:
+    """Sheet number and title read from a single page's text."""
+    raw = text or ""
+    number = sheet_number_from_page_text(raw)
+    title = None
+    labeled = _LABELED_TITLE_RE.search(raw)
+    if labeled:
+        title = _clean_title(labeled.group(1))
+    if title is None and number:
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        needle = number.upper().replace(" ", "")
+        index = None
+        for i, line in enumerate(lines):
+            compact = re.sub(r"[^A-Z0-9.\-]", "", line.upper())
+            if needle and needle in compact:
+                index = i
+        if index is not None:
+            for line in reversed(lines[max(0, index - 5) : index]):
+                if _looks_like_title(line):
+                    title = _clean_title(line)
+                    if title:
+                        break
+    return {"sheet_number": number, "sheet_title": title}
+
+
 def name_drawing(
     *,
     filename: str | None,
@@ -277,19 +423,36 @@ def name_drawing(
     discipline: str | None = None,
     drawing_set: str | None = None,
     revision: str | None = None,
+    page_text: str | None = None,
+    use_filename_sheet: bool = True,
+    use_filename_title: bool = True,
 ) -> DrawingName:
-    """Fill sheet labels from the path. Never waits for a person."""
+    """Fill sheet labels from the page, then the path. Never waits for a person.
+
+    Multi-page parents must pass ``use_filename_sheet=False`` so a fat filename
+    cannot stamp PKG1 / ADD01 / NO.4 / W9 onto every sheet. After a split, pass
+    that page's text and let the title block win.
+    """
     parsed = parse_filename(filename)
+    from_page = identity_from_page_text(page_text)
     folder = (
         parse_folder_path(folder_path)
         if folder_path
         else {"job": None, "discipline": None, "drawing_set": None, "filename": None}
     )
     sn = (sheet_number or "").strip() or None
-    if not sn:
-        sn = parsed["sheet_number"]
+    if sn and not is_sheet_number(sn):
+        sn = None
+    if not sn and use_filename_sheet:
+        file_sheet = parsed["sheet_number"]
+        if file_sheet and is_sheet_number(str(file_sheet)):
+            sn = str(file_sheet)
+    if not sn and from_page.get("sheet_number"):
+        sn = from_page["sheet_number"]
     title = (sheet_title or "").strip() or None
-    if not title:
+    if not title and from_page.get("sheet_title"):
+        title = from_page["sheet_title"]
+    if not title and use_filename_title:
         title = parsed["sheet_title"]
     disc = normalize_discipline(discipline) or folder["discipline"]
     if not disc and sn:
@@ -305,15 +468,17 @@ def name_drawing(
     if sn and not _PAGE_RE.match(sn):
         sn = normalize_sheet_number(sn)
 
-    hygiene = classify_label(sn, filename)
+    hygiene = classify_label(sn, filename if use_filename_sheet else None)
     reasons: list[str] = []
     if hygiene.get("label_reason"):
         if hygiene["label_status"] != LABEL_OK:
             reasons.append(str(hygiene["label_reason"]))
-    if not title:
+    if not title and use_filename_title:
         reasons.append("sheet title missing — used filename stem")
         stem = Path(filename or "").stem
         title = stem.replace("_", " ").replace("-", " ").strip()[:500] or None
+    elif not title:
+        reasons.append("sheet title missing")
     needs_review = hygiene["label_status"] != LABEL_OK or not sn or not title
     if hygiene["label_status"] == LABEL_OK and title:
         confidence = 0.92
