@@ -119,13 +119,22 @@ The file is already on B2 and in the project when the issue is only a naming rev
 
 If one office uses unusual folder words, copy `usiscm-ingest.example.yaml` and add those words. Do not encode a single GC's zip naming as a rule.
 
-## Specialty takeoff queue
+## Specialty takeoff
 
-After a clean upload, `UsiscmClient.import_package` writes one `usis.specialty_takeoff.v1` job for that project batch. Both `import` and `watch` use that method. The file is `queued/{job_id}.json` under `C:\usis-cm\data\queues\specialty_takeoff` (`USIS_SPECIALTY_TAKEOFF_QUEUE` overrides the root).
+After a clean upload, `UsiscmClient.import_package` writes one `usis.specialty_takeoff.v1` job for that project batch. Both `import` and `watch` use that method. They do not run specialty scripts. The file is `queued/{job_id}.json` under `C:\usis-cm\data\queues\specialty_takeoff` (`USIS_SPECIALTY_TAKEOFF_QUEUE` overrides the root). A queue write failure is logged and does not fail the upload.
 
-`folder_path` is null at enqueue. This app does not invent an estimate-folder path. A later patch can set `folder_path` and `status=ready_for_takeoff`. Specialty bots claim and run the job; the tray does not drive this queue. A queue write failure is logged and does not fail the upload.
+`folder_path` is null at enqueue. This app does not invent an estimate-folder path. The job stays queued (pending takeoff) until a later patch sets `folder_path` and `status=ready_for_takeoff`.
 
-Enqueue and the optional claim helpers live in `usiscm_ingest.specialty_takeoff`. Contract: [docs/SPECIALTY_TAKEOFF_QUEUE.md](docs/SPECIALTY_TAKEOFF_QUEUE.md).
+Run the scripts with **one** separate worker. It takes the oldest queued project, expands `["all"]` to the nine specialties, and runs each plugged-in script to completion before the next script and before the next project. A null `folder_path` holds the queue until that path is patched.
+
+```bash
+usiscm-ingest specialty-run --once --runners usiscm-specialty-runners.example.yaml
+usiscm-ingest specialty-run
+```
+
+Point `USIS_SPECIALTY_RUNNERS` at a copy of `usiscm-specialty-runners.example.yaml` with a command or `module:function` for each slug. On Windows, schedule `usiscm-ingest specialty-run --once` as a single task. Do not start it from `watch`. The tray does not drive this queue.
+
+Contract: [docs/SPECIALTY_TAKEOFF_QUEUE.md](docs/SPECIALTY_TAKEOFF_QUEUE.md). Code: `usiscm_ingest.specialty_takeoff` (enqueue) and `usiscm_ingest.specialty_runner` (serial run).
 
 ## Tests
 

@@ -1,21 +1,59 @@
 # Specialty Takeoff Queue — `usis.specialty_takeoff.v1`
 
-Canonical contract for the nine specialty takeoff bots. **This repository
-(USISCM Ingest) owns enqueue.** Specialty bots own claim and run. The tray
-must not poll or drive this queue.
+Canonical contract for the nine specialty takeoff scripts. **This repository
+(USISCM Ingest) owns enqueue and the serial runner.** Each specialty's script
+is plugged in from outside this repo. The tray must not poll or drive this
+queue.
 
-Enqueue is a first-class call in `usiscm_ingest.specialty_takeoff`, wired from
-`UsiscmClient.import_package` after a clean catalog + upload. It is not a
-monkey-patch of `C:\usis-cm\ingestion_agent.py`.
+Enqueue is `usiscm_ingest.specialty_takeoff`, called from
+`UsiscmClient.import_package` after a clean catalog + upload. It does not run
+scripts and does not block watch. The worker is a separate process:
+`usiscm-ingest specialty-run`.
 
 ## Ownership
 
 | Concern | Owner |
 |---|---|
 | Enqueue after a clean ingest batch (`imported > 0`, no upload errors) | **This app** — `enqueue_specialty_takeoff` from `UsiscmClient.import_package` (`usiscm-ingest import` and `watch`) |
+| Run every specialty for a project, one script at a time, one project at a time | **This app** — `usiscm-ingest specialty-run` (`usiscm_ingest.specialty_runner`). Not inside watch. |
+| Specialty script bodies | External commands or `module:function` plugs (`USIS_SPECIALTY_RUNNERS`) |
 | Patch `folder_path` later and set `ready_for_takeoff` | Whoever learns the CM estimate folder (not this app at enqueue time). Helper: `patch_job_folder_path` |
-| Claim + run specialty takeoff | Specialty bots (optional helpers in this module) |
 | Tray / connector | Unrelated — must not poll or drive this queue |
+
+## Serial runner
+
+After ingest, schedule **one** worker:
+
+```bash
+usiscm-ingest specialty-run --once --runners path\to\runners.yaml
+usiscm-ingest specialty-run
+```
+
+`--once` drains ready projects and exits (Windows Task Scheduler). Without
+`--once` the process polls and stays up. `deploy/usiscm-ingest-specialty.service`
+is that loop. Do not start a second copy: the queue root holds `runner.lock`
+for the whole drain.
+
+Rules:
+
+1. Finish the current project before claiming the next. An existing `processing/` job is resumed first.
+2. Expand `specialties: ["all"]` to the nine slugs and run those scripts **one after another**. The next script starts only after the previous process returns.
+3. The next project is the oldest queued job (`enqueued_at`, then `job_id`). Finish it before looking at a newer one.
+4. `folder_path` null → that job waits in `queued/` (pending takeoff). The worker does not claim it, does not invent a `Y:\` (or any other) estimate folder, and does not start a newer project ahead of it. When the path is patched, preferred status is `ready_for_takeoff`. A queued job that already has `folder_path` is ready.
+5. If that head job's slugs are not all configured, the queue blocks. Later projects are not started. The job stays in `queued/`.
+6. If one script fails, the rest of that project's scripts still run, in order. The job is then `failed`. The next project starts only after that.
+
+Plug-in file: [usiscm-specialty-runners.example.yaml](../usiscm-specialty-runners.example.yaml).
+
+```yaml
+runners:
+  lockers:
+    command: ["python", "C:\\usis-cm\\specialties\\lockers.py", "--folder", "{folder_path}"]
+  concrete:
+    module: estimating_specialties.concrete:run
+```
+
+`module` calls `function(specialty, job)`. `command` is blocking (`subprocess.run`) with `{folder_path}`, `{project_key}`, `{job_id}`, `{project_id}`, `{estimate_id}` filled from the job. The same values are in `USIS_SPECIALTY_*` environment variables. `USIS_SPECIALTY_SOURCE_PATHS` is the ingested files, separated by the OS path separator.
 
 ## When a job is written
 
@@ -76,28 +114,28 @@ Optional fields this app sets:
 
 - `trigger`: `"ingest_ok"`
 - `file_ids`: drawing / document ids returned by the website, when present
-- `error`, `claimed_at`, `claimed_by`, `finished_at`: null until a consumer sets them
+- `error`, `claimed_at`, `claimed_by`, `finished_at`: null until the runner sets them
 - `source`: `"usiscm_ingest"`
 - `batch_id`: ingest batch id for that `import_package` call
+- `specialty_results`: per-script `{specialty, status, started_at, finished_at, error}` written while the job is in `processing/`
 
 ## Claim convention
 
-1. Consumer lists `queued\*.json` and skips jobs with a null `folder_path` (`iter_ready`).
-2. **Claim** = exclusive move `queued\{job_id}.json` → `processing\{job_id}.json`, set `status=processing`, `claimed_at`, `claimed_by`. `specialties=["all"]` expands to the nine slugs. `folder_path` wins over `estimate_folder`.
-3. On success: move to `done\{job_id}.json`, `status=done`, `finished_at`.
-4. On failure: move to `failed\{job_id}.json`, `status=failed`, `error=…`, `finished_at`.
-5. Filesystem rename plus a JSON rewrite. No PowerShell. This repo does not install or relaunch a tray.
+The serial runner is the consumer. It uses the helpers below. Do not also run per-specialty bots against the same queue.
+
+1. List `queued\*.json` and sort by `enqueued_at`. The oldest job is the only candidate.
+2. If its `folder_path` is null, stop (pending takeoff). Otherwise claim it: move `queued\{job_id}.json` → `processing\{job_id}.json`, set `status=processing`, `claimed_at`, `claimed_by=usiscm_ingest.specialty_runner`. `specialties=["all"]` expands to the nine slugs. `folder_path` wins over `estimate_folder`.
+3. Run each slug's script, one at a time. Append `specialty_results` after each script returns.
+4. On success of every script: move to `done\{job_id}.json`, `status=done`, `finished_at`.
+5. If any script failed: move to `failed\{job_id}.json`, `status=failed`, `error=…`, `finished_at`. Then the next project may start.
+6. Filesystem rename plus a JSON rewrite. No PowerShell. This repo does not install or relaunch a tray.
 
 ```python
-from usiscm_ingest.specialty_takeoff import claim_job, iter_ready, mark_done, mark_failed
+from usiscm_ingest.specialty_runner import run_queue
+from usiscm_ingest.specialty_runner import ConfiguredScripts, load_script_specs
 
-for path, job in iter_ready():
-    claimed = claim_job(job["job_id"], claimed_by="lockers")
-    try:
-        # run specialty takeoff using claimed["folder_path"] and claimed["source_paths"]
-        mark_done(claimed["job_id"])
-    except Exception as exc:
-        mark_failed(claimed["job_id"], error=str(exc))
+specs = load_script_specs(path_to_runners_yaml)
+run_queue(ConfiguredScripts(specs))
 ```
 
 ## Example job (`queued`)

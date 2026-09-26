@@ -7,12 +7,14 @@ Schema ``usis.specialty_takeoff.v1``. One JSON file per job:
 Override the root with ``USIS_SPECIALTY_TAKEOFF_QUEUE``.
 
 Enqueue runs after a clean ``UsiscmClient.import_package`` batch. It never
-raises into the watcher or upload path. ``folder_path`` may be null; this
-module does not invent an estimate-folder location. A later
-``patch_job_folder_path`` sets the path and ``status=ready_for_takeoff``.
+raises into the watcher or upload path and does not run specialty scripts.
+``folder_path`` may be null; this module does not invent an estimate-folder
+location. A later ``patch_job_folder_path`` sets the path and
+``status=ready_for_takeoff``.
 
-Claim, run, and finish belong to specialty bots. The tray does not drive
-this queue.
+The serial worker lives in ``usiscm_ingest.specialty_runner`` and is started
+with ``usiscm-ingest specialty-run``, separate from watch. The tray does not
+drive this queue.
 """
 
 from __future__ import annotations
