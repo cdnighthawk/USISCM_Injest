@@ -119,6 +119,14 @@ The file is already on B2 and in the project when the issue is only a naming rev
 
 If one office uses unusual folder words, copy `usiscm-ingest.example.yaml` and add those words. Do not encode a single GC's zip naming as a rule.
 
+## Specialty takeoff queue
+
+After a clean upload, `UsiscmClient.import_package` writes one `usis.specialty_takeoff.v1` job for that project batch. Both `import` and `watch` use that method. The file is `queued/{job_id}.json` under `C:\usis-cm\data\queues\specialty_takeoff` (`USIS_SPECIALTY_TAKEOFF_QUEUE` overrides the root).
+
+`folder_path` is null at enqueue. This app does not invent an estimate-folder path. A later patch can set `folder_path` and `status=ready_for_takeoff`. Specialty bots claim and run the job; the tray does not drive this queue. A queue write failure is logged and does not fail the upload.
+
+Enqueue and the optional claim helpers live in `usiscm_ingest.specialty_takeoff`. Contract: [docs/SPECIALTY_TAKEOFF_QUEUE.md](docs/SPECIALTY_TAKEOFF_QUEUE.md).
+
 ## Tests
 
 ```bash
