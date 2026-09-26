@@ -213,18 +213,123 @@ def test_project_match_uses_v1_name_field() -> None:
     assert match["id"] == "1"
 
 
-def test_microsoft_skips_create_when_only_documents(tmp_path: Path) -> None:
+def _native_upload(file_name: str) -> dict:
+    return {
+        "mode": "b2_native",
+        "url": "https://pod-000.backblaze.com/b2api/v2/b2_upload_file/x",
+        "authorization": "b2tok",
+        "file_name": file_name,
+    }
+
+
+def test_microsoft_document_uses_native_b2_even_with_ingest_key(tmp_path: Path) -> None:
+    """WIN-C7 had a Microsoft session and an ingest key. Specs must not multipart POST /api/documents."""
+    root = tmp_path / "Job"
+    root.mkdir()
+    (root / "A-101.pdf").write_bytes(b"%PDF-1.4 drawing")
+    (root / "Project Manual.pdf").write_bytes(b"spec-bytes")
+    manifest = ingest_source(root)
+    assert FileCategory.SPEC in {item.category for item in manifest.files}
+
+    b2_calls: list[dict] = []
+
+    def fake_b2(hint, payload, **kwargs):
+        b2_calls.append({"payload": payload, "content_type": kwargs.get("content_type"), "auth": hint.get("authorization")})
+        return {"fileId": "fid", "fileName": hint.get("file_name"), "contentSha1": "abc"}
+
+    def fake_post(url, **kwargs):
+        assert "files" not in kwargs
+        response = MagicMock()
+        response.ok = True
+        response.headers = {}
+        response.status_code = 201
+        if "/jobs/" in url and url.endswith("/drawings"):
+            response.json.return_value = {
+                "item": {"id": "draw-1"},
+                "upload": _native_upload("drawings/A-101.pdf"),
+            }
+        elif "/jobs/" in url and url.endswith("/documents"):
+            body = kwargs.get("json") or {}
+            item = body.get("item") or {}
+            assert item.get("documentType") == "specification"
+            assert item.get("sourceFileName") == "Project Manual.pdf"
+            assert item.get("mimeType") == "application/pdf"
+            response.json.return_value = {
+                "item": {"id": "doc-9", "file_pending": True},
+                "upload": _native_upload("documents/Project-Manual.pdf"),
+            }
+        elif url.endswith("/ack-file"):
+            response.status_code = 200
+            ack = (kwargs.get("json") or {}).get("item") or {}
+            assert ack.get("contentType") == "application/pdf"
+            assert "spec-bytes" not in str(kwargs.get("json"))
+            assert "%PDF" not in str(kwargs.get("json"))
+            response.json.return_value = {"item": {"file_pending": False}}
+        else:
+            response.status_code = 200
+            response.json.return_value = {"item": {}}
+        return response
+
+    client = UsiscmClient(
+        Settings(
+            base_url="https://www.usiscm.com",
+            ms_access_token="ms-token",
+            ingest_api_key="night-key",
+            token_path=tmp_path / "ms.json",
+            sheet_ai=False,
+        ),
+        sleeper=lambda _: None,
+        b2_post=fake_b2,
+    )
+    client.token = "ms-token"
+    client.auth_mode = "microsoft"
+    client.resolve_project = MagicMock(  # type: ignore[method-assign]
+        return_value={"id": "job-uuid", "name": "Job", "kind": "job", "job_id": "job-uuid"}
+    )
+    client.session.post = MagicMock(side_effect=fake_post)
+
+    result = client.import_package(manifest, project_id="job-uuid")
+    urls = [call.args[0] for call in client.session.post.call_args_list]
+    assert any(url.endswith("/api/v1/jobs/job-uuid/documents") for url in urls)
+    assert any(url.endswith("/api/v1/documents/doc-9/ack-file") for url in urls)
+    assert not any(url.rstrip("/").endswith("/api/documents") for url in urls)
+    assert not any("/api/v1/ingest/files" in url for url in urls)
+    assert b"spec-bytes" in [call["payload"] for call in b2_calls]
+    assert all(call["auth"] == "b2tok" for call in b2_calls)
+    assert result.imported == 2
+    assert result.errors == []
+    assert result.details[-1]["endpoint"] == "b2-native"
+    assert result.details[-1]["document_id"] == "doc-9"
+
+
+def test_document_s3_mint_is_refused(tmp_path: Path) -> None:
     root = tmp_path / "Job"
     root.mkdir()
     (root / "Project Manual.pdf").write_bytes(b"spec")
     manifest = ingest_source(root)
-    assert FileCategory.SPEC in {item.category for item in manifest.files}
+    issues: list[dict] = []
 
     def fake_post(url, **kwargs):
         response = MagicMock()
         response.ok = True
-        response.status_code = 201
-        response.json.return_value = {"document": {}, "count": 1}
+        response.headers = {}
+        if "/jobs/" in url and url.endswith("/documents"):
+            response.status_code = 201
+            response.json.return_value = {
+                "item": {"id": "doc-1"},
+                "upload": {
+                    "mode": "s3_presigned_put",
+                    "url": "https://s3.us-west-004.backblazeb2.com/bucket/key?X-Amz-Credential=x",
+                    "authorization": "nope",
+                },
+            }
+        elif url.endswith("/ingest/errors"):
+            issues.append(kwargs.get("json") or {})
+            response.status_code = 201
+            response.json.return_value = {"item": {"id": "err-1"}}
+        else:
+            response.status_code = 200
+            response.json.return_value = {}
         return response
 
     client = UsiscmClient(
@@ -233,13 +338,66 @@ def test_microsoft_skips_create_when_only_documents(tmp_path: Path) -> None:
             ms_access_token="ms-token",
             token_path=tmp_path / "ms.json",
             sheet_ai=False,
-        )
+        ),
+        sleeper=lambda _: None,
+        b2_post=lambda *a, **k: (_ for _ in ()).throw(AssertionError("B2 must not be called")),
     )
     client.token = "ms-token"
     client.auth_mode = "microsoft"
-    client.resolve_project = MagicMock(return_value={"id": "abc-uuid", "name": "Job"})  # type: ignore[method-assign]
+    client.resolve_project = MagicMock(return_value={"id": "job-uuid", "kind": "job"})  # type: ignore[method-assign]
     client.session.post = MagicMock(side_effect=fake_post)
-    result = client.import_package(manifest, project_id="abc-uuid")
+
+    result = client.import_package(manifest, project_id="job-uuid")
+    assert result.imported == 0
+    assert result.errors
+    assert any("s3" in (err["error"] or "").lower() for err in result.errors)
+    assert issues and issues[0]["kind"] == "document"
+
+
+def test_ingest_key_document_duplicate_skips_b2(tmp_path: Path) -> None:
+    root = tmp_path / "Job"
+    root.mkdir()
+    (root / "Project Manual.pdf").write_bytes(b"spec")
+    manifest = ingest_source(root)
+
+    def fake_post(url, **kwargs):
+        assert "files" not in kwargs
+        response = MagicMock()
+        response.ok = True
+        response.status_code = 200
+        response.headers = {}
+        response.json.return_value = {
+            "document": {"id": "doc-kept", "file_pending": False},
+            "duplicate": True,
+        }
+        return response
+
+    client = UsiscmClient(
+        Settings(
+            base_url="https://www.usiscm.com",
+            ingest_api_key="night-key",
+            token_path=tmp_path / "ms.json",
+            sheet_ai=False,
+        ),
+        b2_post=lambda *a, **k: (_ for _ in ()).throw(AssertionError("B2 must not be called")),
+    )
+    client.token = "night-key"
+    client.auth_mode = "ingest_key"
+    client.resolve_project = MagicMock(return_value={"id": "job-1", "name": "Job"})  # type: ignore[method-assign]
+    client.session.post = MagicMock(side_effect=fake_post)
+
+    result = client.import_package(manifest, project_id="job-1")
     urls = [call.args[0] for call in client.session.post.call_args_list]
-    assert any("/api/v1/ingest/files" in url for url in urls)
-    assert result.imported >= 1
+    assert urls == ["https://www.usiscm.com/api/documents"]
+    assert result.imported == 1
+    assert result.errors == []
+    assert result.details[0]["document_id"] == "doc-kept"
+
+
+def test_content_type_for_office_files() -> None:
+    from usiscm_ingest.client import content_type_for
+
+    assert content_type_for(".pdf") == "application/pdf"
+    assert content_type_for(".docx").endswith("wordprocessingml.document")
+    assert content_type_for(".xlsx").endswith("spreadsheetml.sheet")
+    assert content_type_for(".dwg") == "application/acad"

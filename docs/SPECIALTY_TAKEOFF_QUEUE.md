@@ -60,9 +60,11 @@ runners:
 Grain is **one job per `import_package` call**: one project, and the files in
 that run.
 
-`import_package` uploads drawings (website catalog row, native B2 or
-`POST /api/drawings`, then ack) and documents (`POST /api/documents` or
-`POST /api/v1/ingest/files`). After those calls are tallied:
+`import_package` uploads drawings and documents the same way: website catalog
+row (metadata only), native B2 from this PC, then ack. Microsoft uses
+`POST /api/v1/jobs/{id}/drawings` and `POST /api/v1/jobs/{id}/documents`.
+The ingest key uses JSON `POST /api/drawings` and `POST /api/documents`.
+After those calls are tallied:
 
 - At least one file has `imported > 0` and the batch recorded **no** upload errors → one `queued/{job_id}.json`.
 - Dry run, zero stored files, or any upload error → no job. `watch` retries a failed batch; the job is written once a later run is clean.

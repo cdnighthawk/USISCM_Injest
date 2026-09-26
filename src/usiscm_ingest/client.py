@@ -1,15 +1,14 @@
 """HTTP client for USIS Construction Management.
 
-Drawings follow the USISPdfApp path: catalog row on the website, PDF bytes
-straight to native B2, then ack. Documents use the ingest API (or the
-session ingest route). Automatic drawing names never wait for a person;
-ambiguous names still upload and are logged on ``/api/v1/ingest/errors``
-so they show up in the CM ingest tracker.
+Drawings and other documents follow the USISPdfApp path: catalog row on the
+website, file bytes straight to native B2, then a metadata-only ack.
+Render never receives the file. Automatic drawing names never wait for a
+person; ambiguous names still upload and are logged on
+``/api/v1/ingest/errors`` so they show up in the CM ingest tracker.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 import uuid
@@ -23,7 +22,6 @@ from usiscm_ingest.b2 import (
     B2_UPLOAD_URL_UNAVAILABLE,
     S3_FALLBACK_FORBIDDEN,
     B2Error,
-    file_sha256,
     parse_upload_hint,
     post_file,
     sha256_hex,
@@ -52,6 +50,19 @@ DRAWING_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 DOCUMENT_EXTENSIONS = {".pdf", ".dwg", ".doc", ".docx", ".xls", ".xlsx", ".png", ".jpg", ".jpeg"}
 ISSUE_SOURCE = "usiscm_ingest"
 _MINT_BACKOFF = (2, 8, 30)
+_CONTENT_TYPES = {
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".dwg": "application/acad",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
 
 
 class UsiscmError(RuntimeError):
@@ -505,34 +516,21 @@ class UsiscmClient:
         )
         created = _json(response)
         if response.status_code not in {200, 201}:
-            raise UsiscmError(created.get("error") or f"drawing create failed ({response.status_code})")
+            raise UsiscmError(_error_text(created) or f"drawing create failed ({response.status_code})")
         drawing = created.get("item") or created.get("drawing") or {}
         drawing_id = str(drawing.get("id") or drawing.get("drawing_id") or "")
         if not drawing_id:
             raise UsiscmError("website accepted the drawing row but returned no id")
-        hint = created.get("upload")
-        if not hint:
-            hint = self._mint_upload(drawing_id)
-        stored = self._post_b2_with_retry(drawing_id, hint, payload)
-        ack = self.session.post(
-            self._url(f"api/v1/drawings/{drawing_id}/ack-file"),
-            json={
-                "byte_size": len(payload),
-                "content_hash": digest,
-                "item": {
-                    "b2FileId": stored.get("fileId"),
-                    "b2FileName": stored.get("fileName"),
-                    "contentSha1": stored.get("contentSha1"),
-                    "contentLength": len(payload),
-                    "sha256": digest,
-                    "contentType": "application/pdf",
-                },
-            },
-            timeout=self.timeout,
+        self._complete_b2_upload(
+            http=self.session,
+            row_id=drawing_id,
+            created=created,
+            payload=payload,
+            digest=digest,
+            content_type="application/pdf",
+            kind="drawing",
+            api="v1",
         )
-        ack_payload = _json(ack)
-        if not ack.ok:
-            raise UsiscmError(ack_payload.get("error") or f"drawing ack failed ({ack.status_code})")
         return {
             "endpoint": "b2-native",
             "filename": item.path.name,
@@ -541,18 +539,29 @@ class UsiscmClient:
             "errors": [],
         }
 
-    def _mint_upload(self, drawing_id: str) -> dict[str, Any]:
+    def _mint_upload(
+        self,
+        row_id: str,
+        *,
+        kind: str = "drawing",
+        session: requests.Session | None = None,
+        api: str = "v1",
+    ) -> dict[str, Any]:
+        http = session or self.session
+        collection = "documents" if kind == "document" else "drawings"
+        if api == "v1":
+            path = f"api/v1/{collection}/{row_id}/upload-session"
+        else:
+            path = f"api/{collection}/{row_id}/b2-upload-url"
         last: dict[str, Any] | None = None
         for attempt, wait in enumerate(_MINT_BACKOFF, start=1):
-            response = self.session.post(
-                self._url(f"api/v1/drawings/{drawing_id}/upload-session"),
-                timeout=self.timeout,
-            )
+            response = http.post(self._url(path), timeout=self.timeout)
             payload = _json(response)
-            if response.ok and (payload.get("upload") or payload.get("url") or payload.get("mode")):
-                return payload.get("upload") or payload
+            hint = _upload_hint(payload)
+            if response.ok and hint:
+                return hint
             last = payload
-            if response.status_code == 503 or str(payload.get("error") or "") == B2_UPLOAD_URL_UNAVAILABLE:
+            if _mint_unavailable(response, payload):
                 retry_after = response.headers.get("Retry-After")
                 delay = int(retry_after) if retry_after and str(retry_after).isdigit() else wait
                 logger.warning("B2 mint unavailable (attempt %s); waiting %ss", attempt, delay)
@@ -560,11 +569,21 @@ class UsiscmClient:
                 continue
             break
         raise B2Error(
-            (last or {}).get("error") or B2_UPLOAD_URL_UNAVAILABLE,
+            _error_text(last or {}) or B2_UPLOAD_URL_UNAVAILABLE,
             B2_UPLOAD_URL_UNAVAILABLE,
         )
 
-    def _post_b2_with_retry(self, drawing_id: str, hint: dict[str, Any] | None, payload: bytes) -> dict[str, Any]:
+    def _post_b2_with_retry(
+        self,
+        row_id: str,
+        hint: dict[str, Any] | None,
+        payload: bytes,
+        *,
+        content_type: str = "application/pdf",
+        kind: str = "drawing",
+        session: requests.Session | None = None,
+        api: str = "v1",
+    ) -> dict[str, Any]:
         current = hint
         last_error: Exception | None = None
         for attempt in range(1, 4):
@@ -573,7 +592,7 @@ class UsiscmClient:
                 return self._b2_post(
                     parsed,
                     payload,
-                    content_type="application/pdf",
+                    content_type=content_type,
                     timeout=self.settings.upload_timeout,
                 )
             except B2Error as exc:
@@ -583,10 +602,63 @@ class UsiscmClient:
                 if attempt >= 3:
                     raise
                 logger.warning("B2 POST failed (%s); minting a new URL", exc)
-                current = self._mint_upload(drawing_id)
+                current = self._mint_upload(row_id, kind=kind, session=session, api=api)
         raise last_error or B2Error("B2 upload failed")
 
+    def _complete_b2_upload(
+        self,
+        *,
+        http: requests.Session,
+        row_id: str,
+        created: dict[str, Any],
+        payload: bytes,
+        digest: str,
+        content_type: str,
+        kind: str,
+        api: str,
+    ) -> None:
+        """POST bytes to native B2, then ack metadata only. No file body to Render."""
+        hint = _upload_hint(created)
+        if not hint:
+            hint = self._mint_upload(row_id, kind=kind, session=http, api=api)
+        stored = self._post_b2_with_retry(
+            row_id,
+            hint,
+            payload,
+            content_type=content_type,
+            kind=kind,
+            session=http,
+            api=api,
+        )
+        collection = "documents" if kind == "document" else "drawings"
+        if api == "v1":
+            ack_path = f"api/v1/{collection}/{row_id}/ack-file"
+        else:
+            ack_path = f"api/{collection}/{row_id}/ack-file"
+        ack = http.post(
+            self._url(ack_path),
+            json={
+                "byte_size": len(payload),
+                "content_hash": digest,
+                "item": {
+                    "b2FileId": stored.get("fileId"),
+                    "b2FileName": stored.get("fileName"),
+                    "contentSha1": stored.get("contentSha1"),
+                    "contentLength": len(payload),
+                    "sha256": digest,
+                    "contentType": content_type,
+                },
+            },
+            timeout=self.timeout,
+        )
+        ack_payload = _json(ack)
+        if not ack.ok:
+            label = "document" if kind == "document" else "drawing"
+            raise UsiscmError(_error_text(ack_payload) or f"{label} ack failed ({ack.status_code})")
+
     def _upload_drawing_ingest_key(self, project_id: str, item, named: DrawingName, label: str) -> dict[str, Any]:
+        payload = item.path.read_bytes()
+        digest = sha256_hex(payload)
         metadata = {
             "project_id": project_id,
             "filename": item.path.name,
@@ -598,22 +670,45 @@ class UsiscmClient:
             "revision": named.revision,
             "split_pages": False,
             "source": ISSUE_SOURCE,
+            "sourceSystem": ISSUE_SOURCE,
             "source_id": item.relative_path,
-            "content_hash": file_sha256(item.path),
+            "content_hash": digest,
+            "mimeType": "application/pdf",
         }
         response = self.session.post(
             self._url("api/drawings"),
-            files={"file": (item.path.name, item.path.read_bytes())},
-            data={"metadata": json.dumps(metadata), "sourceSystem": ISSUE_SOURCE},
-            timeout=max(self.timeout, 180),
+            json=metadata,
+            timeout=self.timeout,
         )
-        payload = _json(response)
-        if not response.ok and response.status_code != 201:
-            raise UsiscmError(payload.get("error") or f"ingest drawing failed ({response.status_code})")
+        created = _json(response)
+        if response.status_code not in {200, 201}:
+            raise UsiscmError(_error_text(created) or f"ingest drawing failed ({response.status_code})")
+        drawing_id = _row_id(created)
+        if _stored_duplicate(created):
+            return {
+                "endpoint": "ingest/drawings",
+                "filename": item.path.name,
+                "imported": 1,
+                "drawing_id": drawing_id,
+                "errors": [],
+            }
+        if not drawing_id:
+            raise UsiscmError("website accepted the drawing row but returned no id")
+        self._complete_b2_upload(
+            http=self.session,
+            row_id=drawing_id,
+            created=created,
+            payload=payload,
+            digest=digest,
+            content_type="application/pdf",
+            kind="drawing",
+            api="ingest",
+        )
         return {
             "endpoint": "ingest/drawings",
             "filename": item.path.name,
-            "imported": int(payload.get("count") or 1),
+            "imported": 1,
+            "drawing_id": drawing_id,
             "errors": [],
         }
 
@@ -628,11 +723,13 @@ class UsiscmClient:
     ) -> dict[str, Any]:
         self._ensure_auth()
         project_id = str(project.get("id") or project.get("project_id") or "")
+        endpoint = "b2-native" if self.uses_microsoft else "ingest/documents"
         try:
-            if self.settings.ingest_api_key:
-                return self._upload_document_ingest_key(project_id, item, category, label)
-            return self._upload_document_session(project_id, item, category, label, batch_id=batch_id)
-        except (UsiscmError, OSError) as exc:
+            if self.uses_microsoft:
+                return self._upload_document_native_b2(project, item, category, label)
+            return self._upload_document_ingest_key(project_id, item, category, label)
+        except (UsiscmError, B2Error, OSError) as exc:
+            code = getattr(exc, "code", None)
             self.report_issue(
                 message=str(exc),
                 relative_path=item.relative_path,
@@ -641,76 +738,128 @@ class UsiscmClient:
                 batch_id=batch_id,
                 project_id=project_id,
                 project_number=_project_number(project),
-                detail={"category": category.value},
+                detail={"category": category.value, "code": code},
             )
             return {
-                "endpoint": "ingest/documents",
+                "endpoint": endpoint,
                 "filename": item.path.name,
                 "imported": 0,
                 "error": str(exc),
             }
 
-    def _upload_document_ingest_key(self, project_id: str, item, category: FileCategory, label: str) -> dict[str, Any]:
-        session = self.ingest_session if self.uses_microsoft else self.session
-        metadata = {
-            "project_id": project_id,
-            "filename": item.path.name,
-            "relative_path": item.relative_path,
-            "document_type": category.document_type,
-            "title": item.path.stem,
-            "source": ISSUE_SOURCE,
-            "source_id": item.relative_path,
-            "folder_name": label,
-            "content_hash": file_sha256(item.path),
-        }
-        response = session.post(
-            self._url("api/documents"),
-            files={"file": (item.path.name, item.path.read_bytes())},
-            data={"metadata": json.dumps(metadata), "sourceSystem": ISSUE_SOURCE},
-            timeout=max(self.timeout, 180),
-        )
-        payload = _json(response)
-        if response.ok or response.status_code == 201:
-            return {"endpoint": "ingest/documents", "filename": item.path.name, "imported": 1, "errors": []}
-        raise UsiscmError(payload.get("error") or f"document upload failed ({response.status_code})")
-
-    def _upload_document_session(
+    def _upload_document_native_b2(
         self,
-        project_id: str,
+        project: dict[str, Any],
         item,
         category: FileCategory,
         label: str,
-        *,
-        batch_id: str,
     ) -> dict[str, Any]:
+        job_id = _job_id(project)
+        if not job_id:
+            raise UsiscmError("project has no job id for native B2 document create")
+        payload = item.path.read_bytes()
+        digest = sha256_hex(payload)
+        content_type = content_type_for(item.path.suffix)
+        create_body = {
+            "item": {
+                "sourceFileName": item.path.name,
+                "documentType": category.document_type,
+                "title": item.path.stem or label,
+                "mimeType": content_type,
+                "contentHash": digest,
+            }
+        }
+        response = self.session.post(
+            self._url(f"api/v1/jobs/{job_id}/documents"),
+            json=create_body,
+            timeout=self.timeout,
+        )
+        created = _json(response)
+        if response.status_code not in {200, 201}:
+            raise UsiscmError(_error_text(created) or f"document create failed ({response.status_code})")
+        document_id = _row_id(created)
+        if _stored_duplicate(created):
+            return {
+                "endpoint": "b2-native",
+                "filename": item.path.name,
+                "imported": 1,
+                "document_id": document_id,
+                "errors": [],
+            }
+        if not document_id:
+            raise UsiscmError("website accepted the document row but returned no id")
+        self._complete_b2_upload(
+            http=self.session,
+            row_id=document_id,
+            created=created,
+            payload=payload,
+            digest=digest,
+            content_type=content_type,
+            kind="document",
+            api="v1",
+        )
+        return {
+            "endpoint": "b2-native",
+            "filename": item.path.name,
+            "imported": 1,
+            "document_id": document_id,
+            "errors": [],
+        }
+
+    def _upload_document_ingest_key(self, project_id: str, item, category: FileCategory, label: str) -> dict[str, Any]:
+        http = self.ingest_session if self.uses_microsoft and self.settings.ingest_api_key else self.session
+        payload = item.path.read_bytes()
+        digest = sha256_hex(payload)
+        content_type = content_type_for(item.path.suffix)
         metadata = {
             "project_id": project_id,
             "filename": item.path.name,
             "relative_path": item.relative_path,
             "document_type": category.document_type,
-            "title": item.path.stem,
+            "title": item.path.stem or label,
             "source": ISSUE_SOURCE,
+            "sourceSystem": ISSUE_SOURCE,
             "source_id": item.relative_path,
             "folder_name": label,
-            "batch_id": batch_id,
-            "kind": "document",
-            "content_hash": file_sha256(item.path),
+            "content_hash": digest,
+            "mimeType": content_type,
         }
-        response = self.session.post(
-            self._url("api/v1/ingest/files"),
-            files={"file": (item.path.name, item.path.read_bytes())},
-            data={
-                "metadata": json.dumps(metadata),
-                "kind": "document",
-                "batch_id": batch_id,
-                "content_hash": metadata["content_hash"],
-            },
-            timeout=max(self.timeout, 180),
+        response = http.post(
+            self._url("api/documents"),
+            json=metadata,
+            timeout=self.timeout,
         )
-        payload = _json(response)
-        if response.ok or response.status_code == 201:
-            return {"endpoint": "v1/ingest/files", "filename": item.path.name, "imported": 1, "errors": []}
-        raise UsiscmError(payload.get("error") or f"document upload failed ({response.status_code})")
+        created = _json(response)
+        if response.status_code not in {200, 201}:
+            raise UsiscmError(_error_text(created) or f"document upload failed ({response.status_code})")
+        document_id = _row_id(created)
+        if _stored_duplicate(created):
+            return {
+                "endpoint": "ingest/documents",
+                "filename": item.path.name,
+                "imported": 1,
+                "document_id": document_id,
+                "errors": [],
+            }
+        if not document_id:
+            raise UsiscmError("website accepted the document row but returned no id")
+        self._complete_b2_upload(
+            http=http,
+            row_id=document_id,
+            created=created,
+            payload=payload,
+            digest=digest,
+            content_type=content_type,
+            kind="document",
+            api="ingest",
+        )
+        return {
+            "endpoint": "ingest/documents",
+            "filename": item.path.name,
+            "imported": 1,
+            "document_id": document_id,
+            "errors": [],
+        }
 
     def _ensure_auth(self) -> None:
         if not self.token:
@@ -720,6 +869,78 @@ class UsiscmClient:
 
     def _url(self, path: str) -> str:
         return urljoin(self.base_url, path.lstrip("/"))
+
+
+def content_type_for(suffix: str) -> str:
+    return _CONTENT_TYPES.get((suffix or "").lower(), "application/octet-stream")
+
+
+def _error_text(payload: dict[str, Any] | None) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    err = payload.get("error")
+    if isinstance(err, dict):
+        code = str(err.get("code") or "").strip()
+        message = str(err.get("message") or "").strip()
+        if code and message:
+            return f"{code}: {message}"
+        return message or code
+    if isinstance(err, str):
+        return err.strip()
+    return ""
+
+
+def _upload_hint(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    upload = payload.get("upload")
+    if isinstance(upload, dict):
+        return upload
+    item = payload.get("item")
+    if isinstance(item, dict) and (item.get("url") or item.get("uploadUrl") or item.get("upload_url")):
+        return item
+    if payload.get("url") or payload.get("uploadUrl") or payload.get("mode") or payload.get("protocol"):
+        return payload
+    return None
+
+
+def _row_id(payload: dict[str, Any] | None) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("document", "drawing", "item"):
+        row = payload.get(key)
+        if not isinstance(row, dict):
+            continue
+        if row.get("url") or row.get("uploadUrl") or row.get("upload_url"):
+            continue
+        ident = row.get("id") or row.get("document_id") or row.get("drawing_id")
+        if ident:
+            return str(ident)
+    return ""
+
+
+def _stored_duplicate(payload: dict[str, Any] | None) -> bool:
+    """True when the website already has the bytes and no B2 write is required."""
+    if not isinstance(payload, dict) or not payload.get("duplicate"):
+        return False
+    for key in ("document", "drawing", "item"):
+        row = payload.get(key)
+        if isinstance(row, dict) and "file_pending" in row and not (row.get("url") or row.get("uploadUrl")):
+            return not bool(row.get("file_pending"))
+    if "file_pending" in payload:
+        return not bool(payload.get("file_pending"))
+    return True
+
+
+def _mint_unavailable(response: requests.Response, payload: dict[str, Any]) -> bool:
+    if response.status_code == 503:
+        return True
+    err = payload.get("error")
+    if err == B2_UPLOAD_URL_UNAVAILABLE:
+        return True
+    if isinstance(err, dict) and str(err.get("code") or "") == B2_UPLOAD_URL_UNAVAILABLE:
+        return True
+    return str(payload.get("upload_error") or "") == B2_UPLOAD_URL_UNAVAILABLE
 
 
 def _json(response: requests.Response) -> dict[str, Any]:

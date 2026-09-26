@@ -201,11 +201,19 @@ def _ok_response(url: str, **kwargs: object) -> MagicMock:
                 "file_name": "drawings/A-101.pdf",
             },
         }
+    elif "/jobs/" in url and str(url).endswith("/documents"):
+        response.json.return_value = {
+            "item": {"id": "doc-9", "file_pending": True},
+            "upload": {
+                "mode": "b2_native",
+                "url": "https://pod-000.backblaze.com/b2api/v2/b2_upload_file/x",
+                "authorization": "b2tok",
+                "file_name": "documents/Project-Manual.pdf",
+            },
+        }
     elif str(url).endswith("/ack-file"):
         response.status_code = 200
-        response.json.return_value = {"item": {"id": "draw-1", "file_pending": False}}
-    elif str(url).endswith("/ingest/files"):
-        response.json.return_value = {"document": {"id": "doc-9"}}
+        response.json.return_value = {"item": {"file_pending": False}}
     else:
         response.status_code = 200
         response.json.return_value = {"item": {}}
@@ -230,9 +238,9 @@ def test_import_enqueues_one_job_for_the_batch(tmp_path: Path, specialty_takeoff
     assert job["cm_ids"]["project_id"] == "job-uuid"
     assert job["cm_ids"]["estimate_id"] == "est-9"
     assert job["folder_path"] is None
-    assert job["file_ids"] == ["draw-1"]
     assert job["batch_id"] == result.batch_id
     assert job["source"] == "usiscm_ingest"
+    assert job["file_ids"] == ["draw-1", "doc-9"]
     assert len(job["source_paths"]) == 2
     assert any(path.endswith("A-101.pdf") for path in job["source_paths"])
     assert any(path.endswith("Project Manual.pdf") for path in job["source_paths"])
