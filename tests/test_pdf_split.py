@@ -4,7 +4,7 @@ from unittest.mock import patch
 import pymupdf
 import pytest
 
-from usiscm_ingest.classify import FileCategory, classify_file
+from usiscm_ingest.classify import ClassifiedFile, FileCategory, classify_file
 from usiscm_ingest.client import UploadResult, UsiscmClient
 from usiscm_ingest.config import Settings
 from usiscm_ingest.package import ingest_source
@@ -45,6 +45,79 @@ def _page_count(path: Path) -> int:
         return int(doc.page_count)
     finally:
         doc.close()
+
+
+def _write_lines(path: Path, pages: list[list[str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = pymupdf.open()
+    try:
+        for lines in pages:
+            page = doc.new_page(width=612, height=792)
+            y = 72
+            for line in lines:
+                page.insert_text((72, y), line)
+                y += 18
+        doc.save(path)
+    finally:
+        doc.close()
+
+
+def test_specs_book_stays_whole_and_drawing_set_splits(tmp_path: Path) -> None:
+    specs = tmp_path / "Drawings" / "Pali_CHS_JAN_2025_Specs.pdf"
+    _write_lines(
+        specs,
+        [
+            ["SECTION 23 00 00", "HEATING, VENTILATING, AND AIR CONDITIONING"],
+            ["PART 1 GENERAL", "1.1 SUMMARY"],
+            ["PART 2 PRODUCTS"],
+            ["PART 3 EXECUTION"],
+        ],
+    )
+    drawing = tmp_path / "Drawings" / "HVAC_DWG.pdf"
+    _write_pdf(
+        drawing,
+        [
+            ("drawing", "M-101", "HVAC PLAN"),
+            ("drawing", "M-102", "HVAC SCHEDULE"),
+            ("drawing", "M-103", "HVAC DETAILS"),
+        ],
+    )
+
+    spec_item = classify_file(specs, root=tmp_path)
+    assert spec_item is not None
+    assert spec_item.category == FileCategory.SPEC
+    kept = expand_drawing_file(spec_item, tmp_path / "work-specs")
+    assert len(kept) == 1
+    assert kept[0].category == FileCategory.SPEC
+    assert kept[0].from_split is False
+    assert kept[0].path == specs.resolve()
+    assert list((tmp_path / "work-specs").rglob("*.pdf")) == []
+
+    mislabeled = ClassifiedFile(
+        path=spec_item.path,
+        relative_path=spec_item.relative_path,
+        category=FileCategory.DRAWING,
+        confidence=spec_item.confidence,
+        reasons=list(spec_item.reasons),
+        size_bytes=spec_item.size_bytes,
+    )
+    still_whole = expand_drawing_file(mislabeled, tmp_path / "work-mislabeled")
+    assert len(still_whole) == 1
+    assert still_whole[0].category == FileCategory.SPEC
+    assert still_whole[0].from_split is False
+    assert still_whole[0].path == specs.resolve()
+    assert _page_count(still_whole[0].path) == 4
+    assert list((tmp_path / "work-mislabeled").rglob("*.pdf")) == []
+
+    draw_item = classify_file(drawing, root=tmp_path)
+    assert draw_item is not None
+    assert draw_item.category == FileCategory.DRAWING
+    sheets = expand_drawing_file(draw_item, tmp_path / "work-draw")
+    assert len(sheets) == 3
+    assert [sheet.sheet_number for sheet in sheets] == ["M-101", "M-102", "M-103"]
+    assert all(sheet.from_split and sheet.category == FileCategory.DRAWING for sheet in sheets)
+    assert all(_page_count(sheet.path) == 1 for sheet in sheets)
+    assert all(sheet.path != drawing.resolve() for sheet in sheets)
 
 
 def test_multipage_drawing_splits_and_names_from_page_text(tmp_path: Path) -> None:

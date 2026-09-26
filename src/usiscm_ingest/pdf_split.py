@@ -27,7 +27,12 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from usiscm_ingest.classify import ClassifiedFile, FileCategory, is_non_drawing_filename
+from usiscm_ingest.classify import (
+    ClassifiedFile,
+    FileCategory,
+    document_category_for_filename,
+    is_non_drawing_filename,
+)
 from usiscm_ingest.drawing_namer import (
     DrawingName,
     is_sheet_number,
@@ -515,15 +520,24 @@ def expand_drawing_file(
     other non-drawing filenames are retagged without being split onto Drawings.
     """
     origin = item.origin_path or str(item.path)
-    if is_non_drawing_filename(item.path.name) and item.category == FileCategory.DRAWING:
-        renamed = _copy_item(
-            item,
-            category=_document_category(item.path.name),
-            sheet_number=None,
-            origin_path=origin,
-            reasons=[*item.reasons, "non-drawing file kept off the drawings path"],
-        )
-        return [renamed]
+    # Specs, addenda, manuals, and other non-drawings stay the original
+    # multi-page PDF. A Drawings folder must not pull a spec book onto sheets.
+    if item.category != FileCategory.DRAWING or is_non_drawing_filename(item.path.name):
+        category = item.category
+        reasons = list(item.reasons)
+        if is_non_drawing_filename(item.path.name):
+            category = document_category_for_filename(item.path.name)
+            reasons = [*reasons, "non-drawing file kept off the drawings path"]
+        return [
+            _copy_item(
+                item,
+                category=category,
+                sheet_number=None if category != FileCategory.DRAWING else item.sheet_number,
+                origin_path=origin,
+                reasons=reasons,
+                from_split=False,
+            )
+        ]
 
     if item.path.suffix.lower() != ".pdf":
         if not item.origin_path:
@@ -585,17 +599,6 @@ def expand_drawing_file(
         )
     logger.info("Split %s into %d sheet PDF(s)", item.path.name, len(outputs))
     return outputs
-
-
-def _document_category(filename: str) -> FileCategory:
-    stem = Path(filename).stem
-    if re.search(r"addend|bulletin", stem, re.I):
-        return FileCategory.ADDENDA
-    if re.search(r"spec|project\s+manual|manual", stem, re.I):
-        return FileCategory.SPEC
-    if re.search(r"rfp|rfq|bid|w-?\s*9|proposal", stem, re.I):
-        return FileCategory.BID_INSTRUCTIONS
-    return FileCategory.OTHER
 
 
 def _leaf_name(path: Path) -> str:

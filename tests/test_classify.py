@@ -97,6 +97,19 @@ def test_addendum_no_4_is_not_a_drawing(tmp_path: Path) -> None:
     assert result.sheet_number is None
 
 
+def test_specs_filename_is_a_spec_even_in_a_drawings_folder(tmp_path: Path) -> None:
+    for relative in (
+        "Pali_CHS_JAN_2025_Specs.pdf",
+        "Drawings/Pali_CHS_JAN_2025_Specs.pdf",
+        "Specs.pdf",
+    ):
+        path = _touch(tmp_path / relative)
+        result = classify_file(path, root=tmp_path)
+        assert result is not None, relative
+        assert result.category == FileCategory.SPEC, (relative, result.category, result.reasons)
+        assert result.sheet_number is None
+
+
 def test_sheet_titled_specifications_stays_a_drawing(tmp_path: Path) -> None:
     path = _touch(tmp_path / "A-101 Wall Specifications.pdf")
     result = classify_file(path, root=tmp_path)
