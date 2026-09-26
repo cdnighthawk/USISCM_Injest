@@ -8,11 +8,14 @@ from usiscm_ingest.classify import FileCategory, classify_file
 from usiscm_ingest.client import UploadResult, UsiscmClient
 from usiscm_ingest.config import Settings
 from usiscm_ingest.package import ingest_source
+from usiscm_ingest.drawing_namer import DrawingName
 from usiscm_ingest.pdf_split import (
     PdfSplitError,
+    _unique_name,
     dual_write_sheet,
     expand_drawing_file,
     resolve_estimate_folder,
+    sheet_output_name,
 )
 
 
@@ -305,6 +308,116 @@ def test_page_that_stays_document_sized_is_skipped(tmp_path: Path, caplog: pytes
     assert "near the full" in caplog.text
     leftovers = list((tmp_path / "work").rglob("*.pdf"))
     assert leftovers == []
+
+
+def _dirty_title_name(*, sheet_number: str | None, title: str) -> DrawingName:
+    return DrawingName(
+        sheet_number=sheet_number,
+        sheet_title=title,
+        discipline=None,
+        drawing_set=None,
+        revision="0",
+        confidence=0.9,
+        needs_review=False,
+        label_status="ok",
+    )
+
+
+def test_newline_sheet_title_is_one_windows_filename(tmp_path: Path) -> None:
+    title = "NEW\n3_100-West-Villa-Street-Suite-101"
+    named = _dirty_title_name(sheet_number="A-101", title=title)
+    filename = sheet_output_name(named, 10, Path("ADD_01_HVAC_DWG.pdf"))
+    assert "\n" not in filename and "\r" not in filename and "\t" not in filename
+    assert not any(char in filename for char in '<>:"/\\|?*')
+    assert filename.endswith(".pdf")
+    assert not filename[:-4].endswith(" ") and not filename[:-4].endswith(".")
+    assert "NEW" in filename and "100-West-Villa" in filename
+
+    work = tmp_path / "sheets"
+    work.mkdir()
+    source = work / "ADD_01__sheet-0011.pdf"
+    source.write_bytes(b"%PDF-1.4\n")
+    final = source.with_name(filename)
+    assert final.parent == work
+    source.rename(final)
+    assert final.is_file()
+    assert final.name == filename
+    assert not (work / "NEW").exists()
+
+
+def test_sanitized_title_collision_appends_page_index() -> None:
+    parent = Path("ADD_01_HVAC_DWG.pdf")
+    first = sheet_output_name(
+        _dirty_title_name(sheet_number="A-101", title="NEW\n3_100-West-Villa-Street-Suite-101"),
+        0,
+        parent,
+    )
+    second = sheet_output_name(
+        _dirty_title_name(sheet_number="A-101", title="NEW\r3_100-West-Villa-Street-Suite-101"),
+        1,
+        parent,
+    )
+    assert first == second
+    used: set[str] = set()
+    kept = _unique_name(first, used, page_index=0)
+    other = _unique_name(second, used, page_index=1)
+    assert kept == first
+    assert other != kept
+    assert "__p0002" in other
+    assert "\n" not in other and "\\" not in other
+
+
+def test_ocr_newline_sheet_number_does_not_split_the_path(tmp_path: Path) -> None:
+    source = tmp_path / "Drawings" / "ADD_01_HVAC_DWG.pdf"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    doc = pymupdf.open()
+    try:
+        for lines in (
+            [
+                "SHEET TITLE: 100-West-Villa-Street-Suite-101",
+                "SHEET NO.",
+                "NEW",
+                "3",
+            ],
+            ["SHEET NO. M-102", "SHEET TITLE: HVAC SCHEDULE"],
+        ):
+            page = doc.new_page(width=612, height=792)
+            y = 72
+            for line in lines:
+                page.insert_text((72, y), line)
+                y += 18
+        doc.save(source)
+    finally:
+        doc.close()
+
+    item = classify_file(source, root=tmp_path)
+    assert item is not None
+    sheets = expand_drawing_file(item, tmp_path / "work")
+    assert len(sheets) == 2
+    assert all(sheet.path != source.resolve() for sheet in sheets)
+    stem_dir = tmp_path / "work" / "ADD_01_HVAC_DWG"
+    for sheet in sheets:
+        assert sheet.path.parent == stem_dir
+        assert sheet.path.is_file()
+        assert "\n" not in sheet.path.name and "\r" not in sheet.path.name
+        assert not any(char in sheet.path.name for char in '<>:"/\\|?*')
+    assert "NEW" not in {part for sheet in sheets for part in sheet.path.parts}
+    assert not (stem_dir / "NEW").exists()
+    assert any(sheet.sheet_number == "M-102" for sheet in sheets)
+
+
+def test_dual_write_sanitizes_newline_in_filename(tmp_path: Path) -> None:
+    source = tmp_path / "A-101.pdf"
+    source.write_bytes(b"%PDF-1.4\n")
+    job = tmp_path / "26092"
+    job.mkdir()
+    written = dual_write_sheet(job, source, "NEW\n3_100-West-Villa-Street-Suite-101.pdf")
+    assert written is not None
+    assert written.parent == job / "02_Processed" / "drawings"
+    assert written.is_file()
+    assert "\n" not in written.name
+    assert "100-West-Villa" in written.name
+    assert not (job / "02_Processed" / "drawings" / "NEW").exists()
 
 
 def test_every_page_failing_does_not_return_the_whole_file(tmp_path: Path) -> None:

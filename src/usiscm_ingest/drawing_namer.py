@@ -23,12 +23,18 @@ LABEL_OK = "ok"
 LABEL_NEEDS_AI = "needs_ai"
 LABEL_UNKNOWN = "unknown"
 
+# Separators inside a sheet id stay on one line. A newline is not a space:
+# OCR "NEW\\n3" must not become the sheet number NEW<newline>3.
+_SHEET_GAP = r"[- \t.]"
 _SHEET_NUM_RE = re.compile(
-    r"^(?:[A-Z]{1,3}\d{0,2}-)?[A-Z]{1,3}[-\s.]?\d{1,4}(?:[.\-]\d{1,4}){0,3}(?:-[A-Z0-9]{1,3})?[A-Z]?$",
+    r"^(?:[A-Z]{1,3}\d{0,2}-)?[A-Z]{1,3}"
+    + _SHEET_GAP
+    + r"?\d{1,4}(?:[.\-]\d{1,4}){0,3}(?:-[A-Z0-9]{1,3})?[A-Z]?$",
     re.IGNORECASE,
 )
 _REV = re.compile(r"(?:^|[_-])rev(?:ision)?[-_]?([A-Z0-9.]+)", re.IGNORECASE)
-_PAGE_RE = re.compile(r"^(?:page|sheet|pg)[\s._-]*\d+$", re.IGNORECASE)
+_PAGE_RE = re.compile(r"^(?:page|sheet|pg)[ \t._-]*\d+$", re.IGNORECASE)
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _IMG_RE = re.compile(r"^(img|image|dsc|scan)[_-]?\d+", re.IGNORECASE)
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
@@ -58,13 +64,17 @@ _JUNK_SHEET_PREFIXES = {
 
 _SHEET_FIND_RE = re.compile(
     r"(?<![A-Za-z0-9])"
-    r"((?:[A-Z]{1,3}\d{0,2}-)?[A-Z]{1,3}[-\s.]?\d{1,4}(?:[.\-]\d{1,4}){0,3}(?:-[A-Z0-9]{1,3})?[A-Z]?)"
+    r"((?:[A-Z]{1,3}\d{0,2}-)?[A-Z]{1,3}"
+    + _SHEET_GAP
+    + r"?\d{1,4}(?:[.\-]\d{1,4}){0,3}(?:-[A-Z0-9]{1,3})?[A-Z]?)"
     r"(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 _LABELED_SHEET_RE = re.compile(
     r"(?:sheet|drawing|dwg)\.?\s*(?:no\.?|number|#)\s*[:\-]?\s*"
-    r"([A-Z]{1,3}(?:\d{0,2}-)?[A-Z]{0,3}[-.\s]?\d{1,4}(?:[.\-]\d{1,4}){0,3}(?:-[A-Z0-9]{1,3})?[A-Z]?)",
+    r"([A-Z]{1,3}(?:\d{0,2}-)?[A-Z]{0,3}"
+    + _SHEET_GAP
+    + r"?\d{1,4}(?:[.\-]\d{1,4}){0,3}(?:-[A-Z0-9]{1,3})?[A-Z]?)",
     re.IGNORECASE,
 )
 _LABELED_TITLE_RE = re.compile(
@@ -176,7 +186,7 @@ def is_junk_sheet_token(raw: str | None) -> bool:
 
 def is_sheet_number(raw: str | None) -> bool:
     token = (raw or "").strip()
-    if not token or _PAGE_RE.match(token):
+    if not token or _CONTROL_RE.search(token) or _PAGE_RE.match(token):
         return False
     if is_junk_sheet_token(token):
         return False
@@ -193,9 +203,18 @@ def find_sheet_number(text: str | None) -> str | None:
     return None
 
 
+def _one_line(raw: str | None, *, limit: int = 500) -> str | None:
+    """Collapse newlines, tabs, and other control characters to a single line."""
+    if not raw:
+        return None
+    text = _CONTROL_RE.sub(" ", raw)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit] or None
+
+
 def normalize_sheet_number(raw: str | None) -> str | None:
     token = (raw or "").strip()
-    if not token:
+    if not token or _CONTROL_RE.search(token):
         return None
     return token.upper().replace(" ", "")[:50]
 
@@ -449,11 +468,11 @@ def name_drawing(
             sn = str(file_sheet)
     if not sn and from_page.get("sheet_number"):
         sn = from_page["sheet_number"]
-    title = (sheet_title or "").strip() or None
+    title = _one_line(sheet_title)
     if not title and from_page.get("sheet_title"):
-        title = from_page["sheet_title"]
+        title = _one_line(from_page["sheet_title"])
     if not title and use_filename_title:
-        title = parsed["sheet_title"]
+        title = _one_line(parsed["sheet_title"])
     disc = normalize_discipline(discipline) or folder["discipline"]
     if not disc and sn:
         disc = discipline_from_sheet_number(sn)
@@ -547,7 +566,7 @@ def apply_ai_identity(named: DrawingName, identity: dict[str, Any] | None) -> Dr
         sheet = normalize_sheet_number(number)
     elif number:
         reasons.append(f"AI sheet number {number!r} is not A-100 style")
-    new_title = title or named.sheet_title
+    new_title = _one_line(title) or _one_line(named.sheet_title)
     new_rev = rev or named.revision
     disc = named.discipline
     if sheet and not disc:

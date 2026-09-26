@@ -78,9 +78,26 @@ class PdfInspection:
     failed_pages: list[int] = field(default_factory=list)
 
 
+_FILENAME_INVALID_RE = re.compile(r'[<>:"/\\|?*]+')
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
+
+
 def _safe_filename(name: str) -> str:
-    cleaned = re.sub(r'[<>:"/\\|?*]+', "-", name).strip(" .")
-    return (cleaned[:180] or "sheet.pdf")
+    """One Windows path segment. Newlines must not become another directory."""
+    text = _CONTROL_RE.sub(" ", name or "")
+    text = _FILENAME_INVALID_RE.sub("-", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    suffix = ""
+    if text.lower().endswith(".pdf"):
+        suffix = ".pdf"
+        text = text[:-4]
+    text = text.strip(" .")
+    if not text:
+        return "sheet.pdf"
+    cleaned = f"{text}{suffix}"
+    if len(cleaned) > 180:
+        cleaned = f"{text[: 180 - len(suffix)].rstrip(' .')}{suffix}"
+    return cleaned or "sheet.pdf"
 
 
 def _work_stem(path: Path) -> str:
@@ -404,14 +421,20 @@ def inspect_pdf(path: Path, dest_dir: Path) -> PdfInspection:
             current.close()
 
 
+def _filename_text(value: str) -> str:
+    text = _CONTROL_RE.sub(" ", value or "")
+    text = _FILENAME_INVALID_RE.sub("-", text)
+    return re.sub(r"\s+", " ", text).strip(" .")
+
+
 def sheet_output_name(named: DrawingName, page_index: int, parent: Path) -> str:
     """File name for one split sheet. Fallback names are not sheet numbers."""
     number = named.sheet_number if named.sheet_number and is_sheet_number(named.sheet_number) else None
     if not number:
         stem = _work_stem(parent)
         return _safe_filename(f"{stem}__page-{page_index + 1:04d}.pdf")
-    stem = number.replace("/", "-")
-    title = named.sheet_title or ""
+    stem = _filename_text(number).replace("/", "-").replace(" ", "")
+    title = _filename_text(named.sheet_title or "")
     if title and title.upper().replace(" ", "") != number.upper().replace(" ", ""):
         slug = re.sub(r"[^A-Za-z0-9]+", "-", title).strip("-")[:40]
         if slug and not slug.lower().startswith("page"):
@@ -419,15 +442,19 @@ def sheet_output_name(named: DrawingName, page_index: int, parent: Path) -> str:
     return _safe_filename(f"{stem}.pdf")
 
 
-def _unique_name(candidate: str, used: set[str]) -> str:
+def _unique_name(candidate: str, used: set[str], *, page_index: int) -> str:
+    candidate = _safe_filename(candidate)
     if candidate not in used:
         used.add(candidate)
         return candidate
-    path = Path(candidate)
-    stem, suffix = path.stem, path.suffix
-    n = 2
+    suffix = ".pdf" if candidate.lower().endswith(".pdf") else ""
+    stem = candidate[: -len(suffix)] if suffix else candidate
+    page = f"__p{page_index + 1:04d}"
+    n = 1
     while True:
-        name = f"{stem}__{n}{suffix}"
+        extra = page if n == 1 else f"{page}__{n}"
+        room = 180 - len(extra) - len(suffix)
+        name = _safe_filename(f"{stem[:room].rstrip(' .')}{extra}{suffix}")
         if name not in used:
             used.add(name)
             return name
@@ -530,7 +557,11 @@ def expand_drawing_file(
         named = _name_page(parent=item, filename=item.path.name, page_text=text, from_split=True)
         page_category = category_for_page_text(text)
         category = page_category or FileCategory.DRAWING
-        filename = _unique_name(sheet_output_name(named, page_number - 1, item.path), used)
+        filename = _unique_name(
+            sheet_output_name(named, page_number - 1, item.path),
+            used,
+            page_index=page_number - 1,
+        )
         final = pdf.with_name(filename)
         if final != pdf:
             pdf.rename(final)

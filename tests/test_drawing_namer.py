@@ -100,6 +100,36 @@ def test_real_sheet_numbers_still_parse() -> None:
     assert is_sheet_number("S2.01")
 
 
+def test_newline_is_not_part_of_a_sheet_number() -> None:
+    from usiscm_ingest.drawing_namer import identity_from_page_text, normalize_sheet_number
+
+    assert is_sheet_number("NEW\n3") is False
+    assert normalize_sheet_number("NEW\n3") is None
+    text = "SHEET TITLE: 100-West-Villa-Street-Suite-101\nSHEET NO.\nNEW\n3\n"
+    identity = identity_from_page_text(text)
+    assert identity["sheet_number"] is None or "\n" not in (identity["sheet_number"] or "")
+    named = name_drawing(
+        filename="ADD_01_HVAC_DWG.pdf",
+        page_text=text,
+        use_filename_sheet=False,
+        use_filename_title=False,
+    )
+    assert named.sheet_number is None or "\n" not in named.sheet_number
+    assert named.sheet_title is None or "\n" not in named.sheet_title
+
+
+def test_explicit_title_newline_is_stored_as_one_line() -> None:
+    named = name_drawing(
+        filename="A-101.pdf",
+        sheet_number="A-101",
+        sheet_title="NEW\n3_100-West-Villa-Street-Suite-101",
+        use_filename_sheet=False,
+        use_filename_title=False,
+    )
+    assert named.sheet_number == "A-101"
+    assert named.sheet_title == "NEW 3_100-West-Villa-Street-Suite-101"
+
+
 def test_page_text_names_sheet_after_split_ignores_parent_filename() -> None:
     text = "FLOOR PLAN\nLEVEL 1\nSHEET NO. A-101\nSHEET TITLE: FLOOR PLAN\nSCALE: 1/8\" = 1'-0\""
     named = name_drawing(
