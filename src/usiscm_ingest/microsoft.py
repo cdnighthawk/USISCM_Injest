@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 MS_LOGIN = "https://login.microsoftonline.com"
 DEFAULT_SCOPES = "openid profile email offline_access User.Read"
 DEFAULT_TOKEN_PATH = Path.home() / ".config" / "usiscm-ingest" / "ms_tokens.json"
+# Renew before expiry so a multi-hour sheet upload is not still using a token
+# that will die during the next native B2 create/ack. Microsoft access tokens
+# are often about an hour; the refresh token from `usiscm-ingest login` is what
+# keeps a night job signed in.
+REFRESH_SKEW_SECONDS = 15 * 60
 
 
 UNATTENDED_HINT = (
@@ -51,9 +56,21 @@ class MicrosoftTokens:
     expires_at: float = 0
     token_type: str = "Bearer"
 
+    def needs_refresh(self, *, now: float | None = None, skew: float = REFRESH_SKEW_SECONDS) -> bool:
+        """True when this access token should be renewed before the next API call.
+
+        ``expires_at <= 0`` means the TTL is unknown (for example an access token
+        passed in from the environment). Those are not refreshed on every call;
+        a 401 still forces one refresh when a refresh token is saved.
+        """
+        if self.expires_at <= 0:
+            return False
+        current = time.time() if now is None else now
+        return current >= (self.expires_at - skew)
+
     @property
     def expired(self) -> bool:
-        return time.time() >= (self.expires_at - 120)
+        return self.needs_refresh()
 
     tenant_id: str = ""
     client_id: str = ""
@@ -231,6 +248,101 @@ def device_code_login(
     raise MicrosoftAuthError("Microsoft login timed out. Run usiscm-ingest login again.")
 
 
+def _require_app(app: EntraApp | None, app_factory: Callable[[], EntraApp] | None) -> EntraApp:
+    if app is not None:
+        return app
+    if app_factory is not None:
+        return app_factory()
+    raise MicrosoftAuthError("Microsoft app is not configured")
+
+
+def _with_supplied_access(cached: MicrosoftTokens | None, access_token: str) -> MicrosoftTokens:
+    """Keep a saved refresh token when the caller passes only an access token."""
+    if cached and cached.access_token == access_token:
+        return cached
+    if cached and cached.refresh_token:
+        return MicrosoftTokens(
+            access_token=access_token,
+            refresh_token=cached.refresh_token,
+            expires_at=0,
+            tenant_id=cached.tenant_id,
+            client_id=cached.client_id,
+            scopes=cached.scopes or DEFAULT_SCOPES,
+        )
+    return MicrosoftTokens(access_token=access_token, expires_at=0)
+
+
+def _saved_token_needs_login_refresh(tokens: MicrosoftTokens) -> bool:
+    """Login-time check. Unknown expiry is renewed once, not on every request."""
+    if not tokens.refresh_token:
+        return False
+    if tokens.expires_at <= 0:
+        return True
+    return tokens.needs_refresh()
+
+
+def _try_refresh(
+    app: EntraApp | None,
+    app_factory: Callable[[], EntraApp] | None,
+    tokens: MicrosoftTokens,
+    token_path: Path,
+    timeout: int,
+) -> MicrosoftTokens | None:
+    if not tokens.refresh_token:
+        return None
+    try:
+        entra = _require_app(app, app_factory)
+        refreshed = refresh_tokens(entra, tokens.refresh_token, timeout=timeout)
+    except MicrosoftAuthError as exc:
+        logger.warning("Microsoft refresh failed: %s", exc)
+        return None
+    save_tokens(token_path, refreshed)
+    return refreshed
+
+
+def resolve_microsoft_tokens(
+    app: EntraApp | None = None,
+    *,
+    token_path: Path,
+    access_token: str | None = None,
+    interactive: bool = False,
+    app_factory: Callable[[], EntraApp] | None = None,
+    timeout: int = 30,
+) -> MicrosoftTokens:
+    """Return a Microsoft session, refreshing it when the access token is near expiry."""
+    cached = load_tokens(token_path)
+    if access_token:
+        supplied = _with_supplied_access(cached, access_token)
+        if _saved_token_needs_login_refresh(supplied):
+            refreshed = _try_refresh(app, app_factory, supplied, token_path, timeout)
+            if refreshed is not None:
+                return refreshed
+        return supplied
+
+    if cached and cached.expires_at > 0 and not cached.needs_refresh():
+        return cached
+    if cached and _saved_token_needs_login_refresh(cached):
+        refreshed = _try_refresh(app, app_factory, cached, token_path, timeout)
+        if refreshed is not None:
+            return refreshed
+        # A known-dead access token cannot carry a night job. Unknown TTL with a
+        # failed refresh falls through the same way.
+    if not interactive:
+        raise MicrosoftAuthError(UNATTENDED_HINT)
+    entra = _require_app(app, app_factory)
+    tokens = device_code_login(entra, timeout=timeout)
+    tokens.tenant_id = entra.tenant_id
+    tokens.client_id = entra.client_id
+    tokens.scopes = entra.scopes
+    save_tokens(token_path, tokens)
+    if not tokens.refresh_token:
+        logger.warning(
+            "Microsoft did not return a refresh token. Night jobs will fail after this access token expires. "
+            "Set USISCM_INGEST_API_KEY for unattended runs."
+        )
+    return tokens
+
+
 def resolve_access_token(
     app: EntraApp,
     *,
@@ -238,31 +350,12 @@ def resolve_access_token(
     access_token: str | None = None,
     interactive: bool = False,
 ) -> str:
-    if access_token:
-        return access_token
-    cached = load_tokens(token_path)
-    if cached and not cached.expired:
-        return cached.access_token
-    if cached and cached.refresh_token:
-        try:
-            refreshed = refresh_tokens(app, cached.refresh_token)
-            save_tokens(token_path, refreshed)
-            return refreshed.access_token
-        except MicrosoftAuthError as exc:
-            logger.warning("Microsoft refresh failed: %s", exc)
-    if not interactive:
-        raise MicrosoftAuthError(UNATTENDED_HINT)
-    tokens = device_code_login(app)
-    tokens.tenant_id = app.tenant_id
-    tokens.client_id = app.client_id
-    tokens.scopes = app.scopes
-    save_tokens(token_path, tokens)
-    if not tokens.refresh_token:
-        logger.warning(
-            "Microsoft did not return a refresh token. Night jobs will fail after this access token expires. "
-            "Set USISCM_INGEST_API_KEY for unattended runs."
-        )
-    return tokens.access_token
+    return resolve_microsoft_tokens(
+        app,
+        token_path=token_path,
+        access_token=access_token,
+        interactive=interactive,
+    ).access_token
 
 
 def _json(response: requests.Response) -> dict[str, Any]:

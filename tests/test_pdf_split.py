@@ -1,9 +1,15 @@
 from pathlib import Path
+from unittest.mock import patch
 
 import pymupdf
+import pytest
 
 from usiscm_ingest.classify import FileCategory, classify_file
+from usiscm_ingest.client import UploadResult, UsiscmClient
+from usiscm_ingest.config import Settings
+from usiscm_ingest.package import ingest_source
 from usiscm_ingest.pdf_split import (
+    PdfSplitError,
     dual_write_sheet,
     expand_drawing_file,
     resolve_estimate_folder,
@@ -106,3 +112,119 @@ def test_dual_write_requires_an_existing_job_folder(tmp_path: Path) -> None:
     assert not (root / "02_Processed").exists()
     assert resolve_estimate_folder({}, r"Y:\Estimates\26092") is None
     assert resolve_estimate_folder({"estimate_folder": str(job)}) == job
+
+
+def _three_sheet_pdf(tmp_path: Path) -> Path:
+    source = tmp_path / "Drawings" / "Palisades Charter HS - HVAC_DWG.pdf"
+    _write_pdf(
+        source,
+        [
+            ("drawing", "M-101", "HVAC PLAN"),
+            ("drawing", "M-102", "HVAC SCHEDULE"),
+            ("drawing", "M-103", "HVAC DETAILS"),
+        ],
+    )
+    return source
+
+
+def test_split_continues_after_one_page_fails(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    source = _three_sheet_pdf(tmp_path)
+    item = classify_file(source, root=tmp_path)
+    assert item is not None
+
+    def fail_overflow(doc, index: int, out: Path) -> None:
+        if index == 1:
+            raise RuntimeError("code=5: exception stack overflow!")
+        _real_mupdf_write(doc, index, out)
+
+    def fail_fallback(path: Path, index: int, out: Path) -> str:
+        raise RuntimeError("fallback also failed")
+
+    with caplog.at_level("ERROR"):
+        with patch("usiscm_ingest.pdf_split._write_page_mupdf", side_effect=fail_overflow):
+            with patch("usiscm_ingest.pdf_split._fallback_split_page", side_effect=fail_fallback):
+                failures: list[str] = []
+                sheets = expand_drawing_file(item, tmp_path / "work", failures=failures)
+
+    drawings = [sheet for sheet in sheets if sheet.category == FileCategory.DRAWING]
+    assert [sheet.sheet_number for sheet in drawings] == ["M-101", "M-103"]
+    assert all(sheet.from_split for sheet in sheets)
+    assert all(_page_count(sheet.path) == 1 for sheet in sheets)
+    assert all(sheet.path != source.resolve() for sheet in sheets)
+    assert any("split page 1 of 3" in " ".join(sheet.reasons) for sheet in drawings)
+    assert any("split page 3 of 3" in " ".join(sheet.reasons) for sheet in drawings)
+    assert failures == [f"could not split page(s) 2 of {source.name}"]
+    assert f"could not split page 2 of {source.name}" in caplog.text
+    assert "stack overflow" in caplog.text
+    assert f"skipped page(s) 2" in caplog.text
+
+
+def test_overflow_page_uses_pypdf_fallback(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    source = _three_sheet_pdf(tmp_path)
+    item = classify_file(source, root=tmp_path)
+    assert item is not None
+
+    def fail_only_schedule(doc, index: int, out: Path) -> None:
+        if index == 1:
+            raise RuntimeError("code=5: exception stack overflow!")
+        _real_mupdf_write(doc, index, out)
+
+    with caplog.at_level("WARNING"):
+        with patch("usiscm_ingest.pdf_split._write_page_mupdf", side_effect=fail_only_schedule):
+            sheets = expand_drawing_file(item, tmp_path / "work")
+
+    drawings = [sheet for sheet in sheets if sheet.category == FileCategory.DRAWING]
+    assert [sheet.sheet_number for sheet in drawings] == ["M-101", "M-102", "M-103"]
+    assert all(_page_count(sheet.path) == 1 for sheet in sheets)
+    assert "split page 2 of" in caplog.text
+    assert "fallback" in caplog.text
+
+
+def _real_mupdf_write(doc, index: int, out: Path) -> None:
+    import pymupdf
+
+    single = pymupdf.open()
+    try:
+        single.insert_pdf(doc, from_page=index, to_page=index)
+        single.save(out)
+    finally:
+        single.close()
+
+
+def test_client_keeps_other_sheets_when_one_page_fails(tmp_path: Path) -> None:
+    source = _three_sheet_pdf(tmp_path)
+    manifest = ingest_source(tmp_path)
+    client = UsiscmClient(
+        Settings(base_url="https://www.usiscm.com", token_path=tmp_path / "ms.json", sheet_ai=False)
+    )
+    client.token = "ms-token"
+    client.auth_mode = "microsoft"
+    result = UploadResult(project_id="job-1", batch_id="batch")
+
+    def fail_overflow(doc, index: int, out: Path) -> None:
+        if index == 1:
+            raise RuntimeError("code=5: exception stack overflow!")
+        _real_mupdf_write(doc, index, out)
+
+    with patch("usiscm_ingest.pdf_split._write_page_mupdf", side_effect=fail_overflow):
+        with patch("usiscm_ingest.pdf_split._fallback_split_page", side_effect=RuntimeError("fallback also failed")):
+            drawings, _documents = client._expand_drawings(
+                manifest, tmp_path / "work", result, report_failures=False
+            )
+
+    assert [sheet.sheet_number for sheet in drawings] == ["M-101", "M-103"]
+    assert any(
+        detail.get("filename") == source.name and "page(s) 2" in detail.get("error", "")
+        for detail in result.details
+    )
+    assert all(sheet.path.name != source.name for sheet in drawings)
+
+
+def test_every_page_failing_does_not_return_the_whole_file(tmp_path: Path) -> None:
+    source = _three_sheet_pdf(tmp_path)
+    item = classify_file(source, root=tmp_path)
+    assert item is not None
+    with patch("usiscm_ingest.pdf_split._write_page_mupdf", side_effect=RuntimeError("code=5: exception stack overflow!")):
+        with patch("usiscm_ingest.pdf_split._fallback_split_page", side_effect=RuntimeError("nope")):
+            with pytest.raises(PdfSplitError, match="failed pages: 1, 2, 3"):
+                expand_drawing_file(item, tmp_path / "work")

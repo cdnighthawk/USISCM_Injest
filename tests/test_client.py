@@ -1,9 +1,14 @@
+import json
+import time
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import requests
 
 from usiscm_ingest.classify import FileCategory
 from usiscm_ingest.client import UsiscmClient, _best_project_match
 from usiscm_ingest.config import Settings
+from usiscm_ingest.microsoft import MicrosoftTokens, load_tokens, save_tokens
 from usiscm_ingest.package import ingest_source
 
 
@@ -592,3 +597,173 @@ def test_content_type_for_office_files() -> None:
     assert content_type_for(".docx").endswith("wordprocessingml.document")
     assert content_type_for(".xlsx").endswith("spreadsheetml.sheet")
     assert content_type_for(".dwg") == "application/acad"
+
+
+def _json_response(status: int, payload: dict, url: str) -> requests.Response:
+    response = requests.Response()
+    response.status_code = status
+    response.url = url
+    response.reason = "Unauthorized" if status == 401 else "OK"
+    response.headers["Content-Type"] = "application/json"
+    response._content = json.dumps(payload).encode()
+    response.encoding = "utf-8"
+    return response
+
+
+class _AuthAdapter(requests.adapters.HTTPAdapter):
+    def __init__(self, handler) -> None:
+        super().__init__()
+        self._handler = handler
+
+    def send(self, request, **kwargs):
+        return self._handler(request)
+
+
+def _microsoft_client(tmp_path: Path, *, expires_in: float = 7200) -> UsiscmClient:
+    token_path = tmp_path / "ms.json"
+    save_tokens(
+        token_path,
+        MicrosoftTokens(
+            access_token="old-token",
+            refresh_token="rtok",
+            expires_at=time.time() + expires_in,
+            tenant_id="tenant",
+            client_id="client",
+        ),
+    )
+    client = UsiscmClient(
+        Settings(
+            base_url="https://www.usiscm.com",
+            token_path=token_path,
+            ms_tenant_id="tenant",
+            ms_client_id="client",
+            sheet_ai=False,
+        )
+    )
+    client.login()
+    return client
+
+
+def _refresh_response() -> MagicMock:
+    response = MagicMock()
+    response.ok = True
+    response.status_code = 200
+    response.json.return_value = {"access_token": "new-token", "refresh_token": "rtok", "expires_in": 3600}
+    return response
+
+
+def test_drawings_post_401_refreshes_and_retries_once(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("USISCM_INGEST_API_KEY", raising=False)
+    client = _microsoft_client(tmp_path)
+    assert client.session.headers["Authorization"] == "Bearer old-token"
+    seen: list[str] = []
+
+    def handler(request):
+        seen.append(request.headers.get("Authorization"))
+        if len(seen) == 1:
+            return _json_response(401, {"error": "authentication required"}, request.url)
+        return _json_response(201, {"item": {"id": "draw-1"}}, request.url)
+
+    client.session.mount("https://", _AuthAdapter(handler))
+    with patch("usiscm_ingest.microsoft.requests.post", return_value=_refresh_response()) as posted:
+        response = client.session.post(
+            client._url("api/v1/jobs/job-1/drawings"),
+            json={"item": {"sheetNumber": "M-101"}},
+            timeout=5,
+        )
+
+    assert response.status_code == 201
+    assert seen == ["Bearer old-token", "Bearer new-token"]
+    assert posted.call_count == 1
+    assert posted.call_args.kwargs["data"]["grant_type"] == "refresh_token"
+    assert posted.call_args.kwargs["data"]["refresh_token"] == "rtok"
+    assert client.session.headers["Authorization"] == "Bearer new-token"
+    saved = load_tokens(tmp_path / "ms.json")
+    assert saved is not None
+    assert saved.access_token == "new-token"
+
+
+def test_401_after_refresh_is_not_retried_again(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("USISCM_INGEST_API_KEY", raising=False)
+    client = _microsoft_client(tmp_path)
+    seen: list[str] = []
+
+    def handler(request):
+        seen.append(request.headers.get("Authorization") or "")
+        return _json_response(401, {"error": "authentication required"}, request.url)
+
+    client.session.mount("https://", _AuthAdapter(handler))
+    with patch("usiscm_ingest.microsoft.requests.post", return_value=_refresh_response()) as posted:
+        response = client.session.post(client._url("api/v1/ingest/errors"), json={"message": "x"}, timeout=5)
+
+    assert response.status_code == 401
+    assert seen == ["Bearer old-token", "Bearer new-token"]
+    assert posted.call_count == 1
+
+
+def test_proactive_refresh_before_request_when_token_is_near_expiry(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("USISCM_INGEST_API_KEY", raising=False)
+    client = _microsoft_client(tmp_path)
+    assert client._microsoft_tokens is not None
+    client._microsoft_tokens.expires_at = time.time() + 30
+    seen: list[str] = []
+
+    def handler(request):
+        seen.append(request.headers.get("Authorization") or "")
+        return _json_response(200, {"authenticated": True, "user": {"email": "c@usis.com"}}, request.url)
+
+    client.session.mount("https://", _AuthAdapter(handler))
+    with patch("usiscm_ingest.microsoft.requests.post", return_value=_refresh_response()) as posted:
+        response = client.session.get(client._url("api/v1/auth/status"), timeout=5)
+
+    assert response.status_code == 200
+    assert seen == ["Bearer new-token"]
+    assert posted.call_count == 1
+    assert client.token == "new-token"
+
+
+def test_ingest_key_401_does_not_refresh_microsoft(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("USISCM_INGEST_API_KEY", raising=False)
+    client = UsiscmClient(
+        Settings(base_url="https://www.usiscm.com", ingest_api_key="night-key", token_path=tmp_path / "ms.json")
+    )
+    client.token = "night-key"
+    client.auth_mode = "ingest_key"
+    client.session.headers["Authorization"] = "Bearer night-key"
+    seen: list[str] = []
+
+    def handler(request):
+        seen.append(request.headers.get("Authorization") or "")
+        return _json_response(401, {"error": "authentication required"}, request.url)
+
+    client.session.mount("https://", _AuthAdapter(handler))
+    with patch("usiscm_ingest.microsoft.requests.post") as posted:
+        response = client.session.post(client._url("api/drawings"), json={"filename": "A-101.pdf"}, timeout=5)
+
+    assert response.status_code == 401
+    assert seen == ["Bearer night-key"]
+    posted.assert_not_called()
+
+
+def test_ingest_key_401_retries_when_the_env_key_changed(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("USISCM_INGEST_API_KEY", "night-key-2")
+    client = UsiscmClient(
+        Settings(base_url="https://www.usiscm.com", ingest_api_key="night-key", token_path=tmp_path / "ms.json")
+    )
+    client.token = "night-key"
+    client.auth_mode = "ingest_key"
+    client.session.headers["Authorization"] = "Bearer night-key"
+    seen: list[str] = []
+
+    def handler(request):
+        seen.append(request.headers.get("Authorization") or "")
+        if len(seen) == 1:
+            return _json_response(401, {"error": "authentication required"}, request.url)
+        return _json_response(201, {"drawing": {"id": "draw-1"}}, request.url)
+
+    client.session.mount("https://", _AuthAdapter(handler))
+    response = client.session.post(client._url("api/drawings"), json={"filename": "A-101.pdf"}, timeout=5)
+
+    assert response.status_code == 201
+    assert seen == ["Bearer night-key", "Bearer night-key-2"]
+    assert client.token == "night-key-2"

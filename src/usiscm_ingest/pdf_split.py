@@ -8,6 +8,11 @@ Drawings API.
 When an estimate folder already exists, sheets are also copied to
 ``<folder>\\02_Processed\\drawings``. This module never creates an
 ``Estimates`` root.
+
+Each page is split on its own. A MuPDF stack overflow on one page is retried
+on a fresh document, then extracted with pikepdf (when installed) or pypdf.
+That page is skipped and logged if every backend fails. The rest of the set
+is still returned.
 """
 
 from __future__ import annotations
@@ -65,7 +70,8 @@ class PdfSplitError(Exception):
 class PdfInspection:
     readable: bool
     page_count: int
-    pages: list[tuple[Path, str]] = field(default_factory=list)
+    pages: list[tuple[Path, str, int]] = field(default_factory=list)
+    failed_pages: list[int] = field(default_factory=list)
 
 
 def _safe_filename(name: str) -> str:
@@ -98,8 +104,176 @@ def category_for_page_text(text: str | None) -> FileCategory | None:
     return None
 
 
+def _discard(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _is_mupdf_overflow(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "stack overflow" in text or "recursion" in text
+
+
+def _page_text_mupdf(doc: object, index: int) -> str:
+    page = doc.load_page(index)  # type: ignore[attr-defined]
+    return page.get_text("text") or ""
+
+
+def _write_page_mupdf(doc: object, index: int, out: Path) -> None:
+    import pymupdf
+
+    single = pymupdf.open()
+    try:
+        single.insert_pdf(doc, from_page=index, to_page=index)
+        single.save(out)
+    finally:
+        single.close()
+
+
+def _mupdf_export_page(doc: object, index: int, out: Path) -> str:
+    text = _page_text_mupdf(doc, index)
+    _write_page_mupdf(doc, index, out)
+    return text
+
+
+def _reopen_mupdf(path: Path, doc: object) -> object:
+    import pymupdf
+
+    try:
+        doc.close()  # type: ignore[attr-defined]
+    except Exception:
+        logger.debug("closing MuPDF document after split failure", exc_info=True)
+    return pymupdf.open(path)
+
+
+def _split_page_pikepdf(path: Path, index: int, out: Path) -> str:
+    import pikepdf
+
+    with pikepdf.open(path) as pdf:
+        dest = pikepdf.Pdf.new()
+        dest.pages.append(pdf.pages[index])
+        dest.save(out)
+    return ""
+
+
+def _split_page_pypdf(path: Path, index: int, out: Path) -> str:
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(str(path), strict=False)
+    page = reader.pages[index]
+    writer = PdfWriter()
+    writer.add_page(page)
+    with out.open("wb") as handle:
+        writer.write(handle)
+    try:
+        return page.extract_text() or ""
+    except Exception as exc:
+        logger.debug("pypdf text extraction failed for page %s of %s: %s", index + 1, path.name, exc)
+        return ""
+
+
+def _fallback_split_page(path: Path, index: int, out: Path) -> str:
+    """Copy one page without MuPDF. pikepdf when present, then pypdf."""
+    errors: list[str] = []
+    for name, writer in (("pikepdf", _split_page_pikepdf), ("pypdf", _split_page_pypdf)):
+        try:
+            return writer(path, index, out)
+        except ImportError:
+            continue
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+            _discard(out)
+    detail = "; ".join(errors) or "no fallback PDF library available"
+    raise PdfSplitError(path.name, detail)
+
+
+def _close_mupdf(doc: object | None) -> None:
+    if doc is None:
+        return
+    try:
+        doc.close()  # type: ignore[attr-defined]
+    except Exception:
+        logger.debug("closing MuPDF document", exc_info=True)
+
+
+def _open_mupdf(path: Path) -> object | None:
+    import pymupdf
+
+    try:
+        return pymupdf.open(path)
+    except Exception as exc:
+        logger.warning("could not reopen %s: %s", path.name, exc)
+        return None
+
+
+def _reopen_or_drop(path: Path, doc: object | None) -> object | None:
+    if doc is None:
+        return None
+    try:
+        return _reopen_mupdf(path, doc)
+    except Exception as exc:
+        logger.warning("could not reopen %s after MuPDF failure: %s", path.name, exc)
+        return None
+
+
+def _export_one_page(path: Path, doc: object | None, index: int, out: Path) -> tuple[str | None, object | None]:
+    """Write one page. Returns ``(text, doc)`` or ``(None, doc)`` when it failed.
+
+    MuPDF is tried once. A non-overflow error is retried on a freshly opened
+    document in case the previous page left the interpreter unusable. Stack
+    overflow is treated as a property of that page and goes straight to the
+    fallback splitter. The returned document is safe to use for the next page.
+    """
+    errors: list[str] = []
+    page_number = index + 1
+    if doc is not None:
+        for attempt in (1, 2):
+            try:
+                text = _mupdf_export_page(doc, index, out)
+                if attempt == 2:
+                    logger.info("MuPDF split recovered on retry for page %s of %s", page_number, path.name)
+                return text, doc
+            except Exception as exc:
+                errors.append(f"mupdf: {exc}")
+                _discard(out)
+                logger.warning(
+                    "MuPDF could not split page %s of %s (attempt %s): %s",
+                    page_number,
+                    path.name,
+                    attempt,
+                    exc,
+                )
+                doc = _reopen_or_drop(path, doc)
+                # Overflow on this page will not succeed on a second MuPDF pass.
+                if doc is None or _is_mupdf_overflow(exc):
+                    break
+    # Drop the MuPDF handle before the other parser opens the same file.
+    # On Windows the source stays locked until MuPDF closes it.
+    _close_mupdf(doc)
+    try:
+        text = _fallback_split_page(path, index, out)
+    except Exception as exc:
+        errors.append(f"fallback: {exc}")
+        _discard(out)
+        logger.error("could not split page %s of %s: %s", page_number, path.name, "; ".join(errors))
+        return None, _open_mupdf(path)
+    logger.warning(
+        "split page %s of %s with fallback after MuPDF failed (%s)",
+        page_number,
+        path.name,
+        "; ".join(errors) or "mupdf unavailable",
+    )
+    return text, _open_mupdf(path)
+
+
 def inspect_pdf(path: Path, dest_dir: Path) -> PdfInspection:
-    """Open a PDF. Multi-page files are written as one PDF per page."""
+    """Open a PDF. Multi-page files are written as one PDF per page.
+
+    A failure on one page does not discard the pages that already split.
+    ``failed_pages`` lists the 1-based page numbers that could not be written.
+    """
     if path.suffix.lower() != ".pdf":
         return PdfInspection(False, 0)
     try:
@@ -112,33 +286,42 @@ def inspect_pdf(path: Path, dest_dir: Path) -> PdfInspection:
     except Exception as exc:
         logger.debug("not a readable PDF %s: %s", path, exc)
         return PdfInspection(False, 0)
+    current: object | None = doc
     try:
         count = int(doc.page_count)
         if count <= 0:
             return PdfInspection(True, 0)
         if count == 1:
-            text = doc.load_page(0).get_text("text") or ""
-            return PdfInspection(True, 1, [(path, text)])
+            try:
+                text = _page_text_mupdf(doc, 0)
+            except Exception as exc:
+                logger.warning("could not read text on page 1 of %s: %s", path.name, exc)
+                text = ""
+            return PdfInspection(True, 1, [(path, text, 1)])
         dest_dir.mkdir(parents=True, exist_ok=True)
-        pages: list[tuple[Path, str]] = []
+        pages: list[tuple[Path, str, int]] = []
+        failed: list[int] = []
         stem = _work_stem(path)
         for index in range(count):
-            text = doc.load_page(index).get_text("text") or ""
-            single = pymupdf.open()
-            try:
-                single.insert_pdf(doc, from_page=index, to_page=index)
-                out = dest_dir / f"{stem}__sheet-{index + 1:04d}.pdf"
-                single.save(out)
-            except Exception as exc:
-                raise PdfSplitError(path.name, f"could not split page {index + 1} of {path.name}: {exc}") from exc
-            finally:
-                single.close()
-            pages.append((out, text))
-        if len(pages) != count:
-            raise PdfSplitError(path.name, f"split {path.name} produced {len(pages)} of {count} pages")
-        return PdfInspection(True, count, pages)
+            out = dest_dir / f"{stem}__sheet-{index + 1:04d}.pdf"
+            text, current = _export_one_page(path, current, index, out)
+            if text is None:
+                failed.append(index + 1)
+                continue
+            pages.append((out, text, index + 1))
+        if count > 1 and not pages:
+            listed = ", ".join(str(number) for number in failed) or "all"
+            raise PdfSplitError(path.name, f"could not split any page of {path.name}; failed pages: {listed}")
+        if failed:
+            logger.error(
+                "split %s skipped page(s) %s",
+                path.name,
+                ", ".join(str(number) for number in failed),
+            )
+        return PdfInspection(True, count, pages, failed)
     finally:
-        doc.close()
+        if current is not None:
+            current.close()
 
 
 def sheet_output_name(named: DrawingName, page_index: int, parent: Path) -> str:
@@ -211,7 +394,12 @@ def _name_page(
     )
 
 
-def expand_drawing_file(item: ClassifiedFile, dest_dir: Path) -> list[ClassifiedFile]:
+def expand_drawing_file(
+    item: ClassifiedFile,
+    dest_dir: Path,
+    *,
+    failures: list[str] | None = None,
+) -> list[ClassifiedFile]:
     """One uploadable file per sheet.
 
     Single-page files and non-PDFs pass through. A multi-page drawing PDF
@@ -236,6 +424,9 @@ def expand_drawing_file(item: ClassifiedFile, dest_dir: Path) -> list[Classified
         return [item]
 
     info = inspect_pdf(item.path, dest_dir / _work_stem(item.path))
+    if info.failed_pages and failures is not None:
+        pages = ", ".join(str(number) for number in info.failed_pages)
+        failures.append(f"could not split page(s) {pages} of {item.path.name}")
     if not info.readable or info.page_count <= 1:
         text = info.pages[0][1] if info.pages else item.page_text
         named = _name_page(parent=item, filename=item.path.name, page_text=text or "", from_split=False)
@@ -255,11 +446,11 @@ def expand_drawing_file(item: ClassifiedFile, dest_dir: Path) -> list[Classified
 
     used: set[str] = set()
     outputs: list[ClassifiedFile] = []
-    for index, (pdf, text) in enumerate(info.pages):
+    for pdf, text, page_number in info.pages:
         named = _name_page(parent=item, filename=item.path.name, page_text=text, from_split=True)
         page_category = category_for_page_text(text)
         category = page_category or FileCategory.DRAWING
-        filename = _unique_name(sheet_output_name(named, index, item.path), used)
+        filename = _unique_name(sheet_output_name(named, page_number - 1, item.path), used)
         final = pdf.with_name(filename)
         if final != pdf:
             pdf.rename(final)
@@ -273,7 +464,7 @@ def expand_drawing_file(item: ClassifiedFile, dest_dir: Path) -> list[Classified
                 relative_path=_relative(item.relative_path, final.name),
                 category=category,
                 confidence=item.confidence,
-                reasons=[*item.reasons, f"split page {index + 1} of {info.page_count} from {item.path.name}"],
+                reasons=[*item.reasons, f"split page {page_number} of {info.page_count} from {item.path.name}"],
                 sheet_number=named.sheet_number if category == FileCategory.DRAWING else None,
                 size_bytes=size,
                 page_text=text,

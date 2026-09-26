@@ -28,7 +28,7 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-Sheet split uses PyMuPDF, which is installed with the package. `--peek-pdf` / `USISCM_SHEET_AI` still control first-page classification text and the website title-block AI.
+Sheet split uses PyMuPDF, which is installed with the package, and falls back to pypdf for a page MuPDF cannot extract. `--peek-pdf` / `USISCM_SHEET_AI` still control first-page classification text and the website title-block AI.
 
 Copy `.env.example` to `.env` on the **server**. Night jobs do not open a Microsoft login.
 
@@ -124,6 +124,10 @@ usiscm-ingest watch --once --reprocess --package 26092
 ```
 
 That re-reads the ACCDocs package whose path contains `26092`, splits multi-page drawing PDFs, uploads each sheet to native B2, and sends addenda, specs, W-9s, RFPs, manuals, and combined bid sets to documents only.
+
+A long `watch`, `import`, or `reprocess` keeps the Microsoft session for the whole run. Before each website call, an access token inside 15 minutes of expiry (or inside one upload timeout, whichever is longer) is refreshed from the saved refresh token. A `401` refreshes once and retries that same request. Sign in again with `usiscm-ingest login` only when the refresh token itself is rejected. The ingest API key does not expire; a `401` on that key retries only if `USISCM_INGEST_API_KEY` was changed in the environment.
+
+Sheet split is per page. If MuPDF hits a stack overflow on one page, that page is extracted with pypdf (or pikepdf when it is installed) and the other pages still upload. Pages that neither library can split are logged by page number and omitted. The run reports those pages, uploads the sheets that did split, and does not send the original multi-page PDF as one drawing.
 
 To also drop the sheets into an estimate folder that is already on disk:
 
