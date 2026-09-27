@@ -1,0 +1,15 @@
+[Unit]
+Description=USISCM estimate package ingest (unattended)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/usiscm-ingest.env
+WorkingDirectory=/opt/usiscm-ingest
+# Ingest only. Specialty scripts run in usiscm-ingest-specialty.service.
+ExecStart=/opt/usiscm-ingest/.venv/bin/usiscm-ingest watch --once
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
