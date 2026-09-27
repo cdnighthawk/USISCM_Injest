@@ -333,6 +333,8 @@ def is_non_drawing_filename(filename: str | None) -> bool:
     blob = f"{stem}\n{_normalize(stem)}"
     if _HARD_DOCUMENT_NAME_RE.search(blob):
         return True
+    # A date such as JAN 2025 is not a sheet id, so it must not keep a spec
+    # book on the drawings path. A real id (A-101) still wins.
     if _SPEC_BOOK_NAME_RE.search(blob) and not find_sheet_number(stem):
         return True
     return False

@@ -171,6 +171,18 @@ def _leading_sheet_letters(token: str) -> str:
     return match.group(1) if match else ""
 
 
+# JAN 2025 / JAN2025 is a date in a filename, not a sheet id.
+_MONTH_YEAR_RE = re.compile(
+    r"^(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEPT|SEP|OCT|NOV|DEC)(?:19|20)\d{2}$",
+    re.IGNORECASE,
+)
+
+
+def _is_month_year_token(raw: str | None) -> bool:
+    compact = re.sub(r"[^A-Za-z0-9]", "", raw or "")
+    return bool(compact and _MONTH_YEAR_RE.match(compact))
+
+
 def is_junk_sheet_token(raw: str | None) -> bool:
     """Package, addendum, and form tokens that must not be stored as sheet numbers."""
     token = (raw or "").strip()
@@ -188,7 +200,7 @@ def is_sheet_number(raw: str | None) -> bool:
     token = (raw or "").strip()
     if not token or _CONTROL_RE.search(token) or _PAGE_RE.match(token):
         return False
-    if is_junk_sheet_token(token):
+    if _is_month_year_token(token) or is_junk_sheet_token(token):
         return False
     return bool(_SHEET_NUM_RE.match(token))
 

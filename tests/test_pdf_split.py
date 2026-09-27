@@ -120,6 +120,55 @@ def test_specs_book_stays_whole_and_drawing_set_splits(tmp_path: Path) -> None:
     assert all(sheet.path != drawing.resolve() for sheet in sheets)
 
 
+def test_dated_spec_book_is_not_split(tmp_path: Path) -> None:
+    """Production name uses spaces: JAN 2025 must not become sheet JAN2025."""
+    pages = [["DIVISION 23"], ["PART 1 GENERAL"], ["PART 2 PRODUCTS"]]
+    documents = {
+        "Pali CHS_JAN 2025_Specs.pdf": FileCategory.SPEC,
+        "Pali_CHS_JAN_2025_Specs.pdf": FileCategory.SPEC,
+        "Project Manual JAN 2025.pdf": FileCategory.SPEC,
+        "Addendum 01 JAN 2025.pdf": FileCategory.ADDENDA,
+    }
+    for name, category in documents.items():
+        path = tmp_path / "Drawings" / name
+        _write_lines(path, pages)
+        item = classify_file(path, root=tmp_path)
+        assert item is not None, name
+        assert item.category == category, (name, item.category, item.sheet_number, item.reasons)
+        assert item.sheet_number is None
+        work = tmp_path / "work" / name
+        kept = expand_drawing_file(item, work)
+        assert len(kept) == 1, name
+        assert kept[0].path == path.resolve()
+        assert kept[0].from_split is False
+        assert kept[0].category == category
+        assert _page_count(kept[0].path) == 3
+        assert list(work.rglob("*.pdf")) == []
+        mislabeled = ClassifiedFile(
+            path=item.path,
+            relative_path=item.relative_path,
+            category=FileCategory.DRAWING,
+            confidence=item.confidence,
+            reasons=list(item.reasons),
+            size_bytes=item.size_bytes,
+        )
+        refused = expand_drawing_file(mislabeled, tmp_path / "mislabeled" / name)
+        assert len(refused) == 1
+        assert refused[0].from_split is False
+        assert refused[0].category != FileCategory.DRAWING
+        assert refused[0].path == path.resolve()
+
+    sheet = tmp_path / "A-101 Wall Specifications.pdf"
+    _write_pdf(sheet, [("drawing", "A-101", "WALL SPECIFICATIONS"), ("drawing", "A-102", "WALL TYPES")])
+    named = classify_file(sheet, root=tmp_path)
+    assert named is not None
+    assert named.category == FileCategory.DRAWING
+    assert named.sheet_number == "A-101"
+    sheets = expand_drawing_file(named, tmp_path / "work-sheet")
+    assert len(sheets) == 2
+    assert all(page.from_split and page.category == FileCategory.DRAWING for page in sheets)
+
+
 def test_multipage_drawing_splits_and_names_from_page_text(tmp_path: Path) -> None:
     source = tmp_path / "Drawings" / "Architectural.pdf"
     _write_pdf(

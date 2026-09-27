@@ -98,6 +98,19 @@ def test_real_sheet_numbers_still_parse() -> None:
     assert parse_filename("A-101 Floor Plan.pdf")["sheet_number"] == "A-101"
     assert is_sheet_number("P3-G0.1.01")
     assert is_sheet_number("S2.01")
+    assert is_sheet_number("S-201")
+    assert is_sheet_number("M1.1")
+    assert is_sheet_number("M-101")
+
+
+def test_month_year_is_not_a_sheet_number() -> None:
+    from usiscm_ingest.drawing_namer import find_sheet_number
+
+    for token in ("JAN 2025", "JAN2025", "JAN-2025", "FEB 2024", "SEPT 2025"):
+        assert is_sheet_number(token) is False, token
+    assert find_sheet_number("Pali CHS_JAN 2025_Specs") is None
+    assert find_sheet_number("Pali_CHS_JAN2025_Specs") is None
+    assert find_sheet_number("A-101 Wall Specifications") == "A-101"
 
 
 def test_newline_is_not_part_of_a_sheet_number() -> None:
