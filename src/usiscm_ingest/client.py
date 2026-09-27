@@ -7,11 +7,14 @@ machine into one PDF per sheet before that upload. Specs, addenda, bid forms,
 W-9s, manuals, and combined bid sets stay on the documents path. Automatic
 drawing names never wait for a person; ambiguous names still upload and are
 logged on ``/api/v1/ingest/errors`` so they show up in the CM ingest tracker.
+A long run refreshes the Microsoft access token before it expires and retries
+a website call once after a 401.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 import time
 import uuid
@@ -39,12 +42,16 @@ from usiscm_ingest.drawing_namer import (
     title_block_jpeg_base64,
 )
 from usiscm_ingest.microsoft import (
+    REFRESH_SKEW_SECONDS,
     UNATTENDED_HINT,
     EntraApp,
     MicrosoftAuthError,
+    MicrosoftTokens,
     discover_entra_app,
     load_tokens,
-    resolve_access_token,
+    refresh_tokens,
+    resolve_microsoft_tokens,
+    save_tokens,
 )
 from usiscm_ingest.package import PackageManifest
 from usiscm_ingest.pdf_split import (
@@ -77,6 +84,41 @@ _CONTENT_TYPES = {
 
 class UsiscmError(RuntimeError):
     pass
+
+
+class UnattendedAuthError(UsiscmError):
+    """Night job cannot renew Microsoft auth and must exit.
+
+    Device-code login is only for ``usiscm-ingest login`` during the day.
+    Watch, import, and reprocess never wait on it.
+    """
+
+
+class RefreshingSession(requests.Session):
+    """Website session that renews Microsoft auth and retries one 401.
+
+    Native B2 uploads do not use this session. Only catalog, ack, and
+    ingest-issue calls do, and those are the calls that failed after the
+    access token expired mid-batch.
+    """
+
+    def __init__(self, client: UsiscmClient, *, kind: str) -> None:
+        super().__init__()
+        self._client = client
+        self.kind = kind
+
+    def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        retried = bool(kwargs.pop("_auth_retry", False))
+        if not retried:
+            self._client.prepare_auth(self.kind)
+        response = super().request(method, url, **kwargs)
+        if response.status_code != 401 or retried:
+            return response
+        if not self._client.recover_unauthorized(self.kind):
+            logger.warning("request stayed unauthorized: %s %s", method, url)
+            return response
+        logger.warning("authentication required; retrying %s %s once after refresh", method, url)
+        return self.request(method, url, _auth_retry=True, **kwargs)
 
 
 @dataclass
@@ -113,10 +155,11 @@ class UsiscmClient:
         self.settings = settings
         self.base_url = settings.base_url.rstrip("/") + "/"
         self.timeout = timeout
-        self.session = requests.Session()
-        self.ingest_session = requests.Session()
+        self.session = RefreshingSession(self, kind="user")
+        self.ingest_session = RefreshingSession(self, kind="ingest")
         self.token: str | None = None
         self.auth_mode: str | None = None
+        self._microsoft_tokens: MicrosoftTokens | None = None
         self._entra: EntraApp | None = None
         self._sleeper = sleeper or time.sleep
         self._b2_post = b2_post or post_file
@@ -156,21 +199,23 @@ class UsiscmClient:
         )
         if can_try_ms or not self.settings.ingest_api_key:
             try:
-                token = resolve_access_token(
-                    self.entra_app(),
+                tokens = resolve_microsoft_tokens(
                     token_path=self.settings.token_path,
                     access_token=self.settings.ms_access_token or None,
                     interactive=interactive,
+                    app_factory=self.entra_app,
+                    timeout=self.timeout,
                 )
-                self.token = token
-                self.auth_mode = "microsoft"
-                self.session.headers["Authorization"] = f"Bearer {token}"
-                if self.settings.ingest_api_key:
-                    self.ingest_session.headers["Authorization"] = f"Bearer {self.settings.ingest_api_key}"
-                return token
+                return self._apply_microsoft(tokens)
             except (MicrosoftAuthError, UsiscmError) as exc:
+                if isinstance(exc, UnattendedAuthError):
+                    raise
                 microsoft_error = MicrosoftAuthError(str(exc))
                 if not self.settings.ingest_api_key:
+                    if not interactive:
+                        raise UnattendedAuthError(
+                            f"{exc} Night ingest will exit and will not wait for a device login."
+                        ) from exc
                     raise UsiscmError(str(exc)) from exc
                 logger.warning("Microsoft session unavailable (%s); using ingest API key", exc)
 
@@ -271,7 +316,9 @@ class UsiscmClient:
         result = UploadResult(project_id=resolved_id, batch_id=batch_id or uuid.uuid4().hex[:16])
         estimate_dir = resolve_estimate_folder(project, estimate_folder)
         with tempfile.TemporaryDirectory(prefix="usiscm-sheets-") as tmp:
-            drawings, rerouted = self._expand_drawings(manifest, Path(tmp), result)
+            drawings, rerouted = self._expand_drawings(
+                manifest, Path(tmp), result, report_failures=not dry_run
+            )
             documents = self._document_items(manifest, result) + rerouted
             if dry_run:
                 named = [_name_item(item).to_dict() for item in drawings]
@@ -325,15 +372,22 @@ class UsiscmClient:
         manifest: PackageManifest,
         dest: Path,
         result: UploadResult,
+        *,
+        report_failures: bool = True,
     ) -> tuple[list, list]:
-        """Split drawing PDFs. Non-sheet pages come back on the document list."""
+        """Split drawing PDFs. Non-sheet pages come back on the document list.
+
+        One page that MuPDF cannot split is recorded and skipped. Sheets that
+        did split are still uploaded.
+        """
         drawings = []
         rerouted = []
         for item in manifest.files_for(FileCategory.DRAWING):
             if item.path.suffix.lower() not in DRAWING_EXTENSIONS:
                 continue
+            failures: list[str] = []
             try:
-                sheets = expand_drawing_file(item, dest)
+                sheets = expand_drawing_file(item, dest, failures=failures)
             except PdfSplitError as exc:
                 logger.error("%s", exc)
                 result.details.append(
@@ -345,6 +399,25 @@ class UsiscmClient:
                     }
                 )
                 continue
+            for message in failures:
+                result.details.append(
+                    {
+                        "endpoint": "b2-native" if self.uses_microsoft else "ingest/drawings",
+                        "filename": item.path.name,
+                        "imported": 0,
+                        "error": message,
+                    }
+                )
+                if report_failures:
+                    self.report_issue(
+                        message=message,
+                        relative_path=item.relative_path,
+                        filename=item.path.name,
+                        kind="split",
+                        batch_id=result.batch_id,
+                        project_id=result.project_id or None,
+                        detail={"filename": item.path.name},
+                    )
             for sheet in sheets:
                 if sheet.category == FileCategory.DRAWING:
                     drawings.append(sheet)
@@ -476,6 +549,8 @@ class UsiscmClient:
                 uploaded = self._upload_drawing_native_b2(project, item, named, label)
             else:
                 uploaded = self._upload_drawing_ingest_key(project_id, item, named, label)
+        except UnattendedAuthError:
+            raise
         except (UsiscmError, B2Error, OSError) as exc:
             code = getattr(exc, "code", None)
             message = str(exc)
@@ -773,6 +848,8 @@ class UsiscmClient:
             if self.uses_microsoft:
                 return self._upload_document_native_b2(project, item, category, label)
             return self._upload_document_ingest_key(project_id, item, category, label)
+        except UnattendedAuthError:
+            raise
         except (UsiscmError, B2Error, OSError) as exc:
             code = getattr(exc, "code", None)
             self.report_issue(
@@ -906,14 +983,114 @@ class UsiscmClient:
             "errors": [],
         }
 
+    def _apply_microsoft(self, tokens: MicrosoftTokens) -> str:
+        self._microsoft_tokens = tokens
+        self.token = tokens.access_token
+        self.auth_mode = "microsoft"
+        self.session.headers["Authorization"] = f"Bearer {tokens.access_token}"
+        if self.settings.ingest_api_key:
+            self.ingest_session.headers["Authorization"] = f"Bearer {self.settings.ingest_api_key}"
+        return tokens.access_token
+
+    def prepare_auth(self, kind: str) -> None:
+        """Refresh a Microsoft token that is inside the renewal window."""
+        if kind == "user" and self.uses_microsoft:
+            self.refresh_microsoft(force=False)
+
+    def recover_unauthorized(self, kind: str) -> bool:
+        """Refresh after a 401. True when the failed request should be retried once."""
+        if kind == "user" and self.uses_microsoft:
+            return self.refresh_microsoft(force=True)
+        if self._session_uses_ingest_key(kind):
+            return self._reload_ingest_key()
+        return False
+
+    def _session_uses_ingest_key(self, kind: str) -> bool:
+        if kind == "ingest":
+            return bool(self.settings.ingest_api_key)
+        return self.uses_ingest_key
+
+    def refresh_microsoft(self, *, force: bool = False) -> bool:
+        """Renew the Microsoft access token from the saved refresh token.
+
+        Proactive renewal runs before a website call when the access token is
+        inside ``REFRESH_SKEW_SECONDS`` (and at least one upload timeout) of
+        expiry. A 401 forces one renewal even if the local clock still thinks
+        the token is valid. Returns True when a new token was stored and the
+        caller should retry.
+        """
+        if not self.uses_microsoft:
+            return False
+        current = self._microsoft_tokens or load_tokens(self.settings.token_path)
+        if current is None:
+            if force:
+                raise _unattended_auth_error("Microsoft session has no saved tokens to refresh.")
+            logger.error("Microsoft session has no saved tokens to refresh")
+            return False
+        skew = max(REFRESH_SKEW_SECONDS, int(self.settings.upload_timeout) + 180)
+        if not force and not current.needs_refresh(skew=skew):
+            self._microsoft_tokens = current
+            return False
+        if not current.refresh_token:
+            raise _unattended_auth_error(
+                "Microsoft access token needs renewal but no refresh token is saved."
+            )
+        if force:
+            logger.warning("Microsoft API returned 401; refreshing the access token")
+        else:
+            remaining = max(0, int(current.expires_at - time.time()))
+            logger.info("Microsoft access token expires in %ss; refreshing before the next request", remaining)
+        try:
+            refreshed = refresh_tokens(self.entra_app(), current.refresh_token, timeout=min(self.timeout, 60))
+        except MicrosoftAuthError as exc:
+            raise _unattended_auth_error(f"Microsoft rejected the refresh token ({exc}).") from exc
+        except requests.RequestException as exc:
+            raise _unattended_auth_error(
+                f"Could not reach Microsoft to refresh the access token ({exc})."
+            ) from exc
+        save_tokens(self.settings.token_path, refreshed)
+        self._microsoft_tokens = refreshed
+        self.token = refreshed.access_token
+        self.session.headers["Authorization"] = f"Bearer {refreshed.access_token}"
+        logger.info("Renewed Microsoft access token for this ingest run")
+        return True
+
+    def _reload_ingest_key(self) -> bool:
+        """Retry once when the process environment has a newer ingest API key.
+
+        The ingest key is a static bearer, not an OAuth token. It is not
+        refreshed on a timer. A 401 retries only if ``USISCM_INGEST_API_KEY``
+        has changed since login (a supervisor swapped the key mid-run).
+        """
+        updated = os.getenv("USISCM_INGEST_API_KEY", "").strip()
+        if not updated or updated == self.settings.ingest_api_key:
+            return False
+        self.settings.ingest_api_key = updated
+        header = f"Bearer {updated}"
+        self.ingest_session.headers["Authorization"] = header
+        if self.uses_ingest_key:
+            self.token = updated
+            self.session.headers["Authorization"] = header
+        logger.warning("USISCM_INGEST_API_KEY changed; retrying the unauthorized request once")
+        return True
+
     def _ensure_auth(self) -> None:
         if not self.token:
             self.login(interactive=False)
-            if not self.token:
-                raise UsiscmError(UNATTENDED_HINT)
+        elif self.uses_microsoft:
+            self.refresh_microsoft(force=False)
+        if not self.token:
+            raise UsiscmError(UNATTENDED_HINT)
 
     def _url(self, path: str) -> str:
         return urljoin(self.base_url, path.lstrip("/"))
+
+
+def _unattended_auth_error(detail: str) -> UnattendedAuthError:
+    """Clear night-job failure. Callers log this and exit; they do not prompt."""
+    return UnattendedAuthError(
+        f"{detail} Night ingest will exit and will not wait for a device login. {UNATTENDED_HINT}"
+    )
 
 
 def _name_item(item) -> DrawingName:

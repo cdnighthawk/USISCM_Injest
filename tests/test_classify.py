@@ -97,6 +97,34 @@ def test_addendum_no_4_is_not_a_drawing(tmp_path: Path) -> None:
     assert result.sheet_number is None
 
 
+def test_specs_filename_is_a_spec_even_in_a_drawings_folder(tmp_path: Path) -> None:
+    for relative in (
+        "Pali_CHS_JAN_2025_Specs.pdf",
+        "Drawings/Pali_CHS_JAN_2025_Specs.pdf",
+        "Drawings/Pali CHS_JAN 2025_Specs.pdf",
+        "Pali CHS JAN 2025 Specs.pdf",
+        "Pali_CHS_JAN2025_Specs.pdf",
+        "FEB 2024 Specs.pdf",
+        "Specs.pdf",
+        "Project Manual JAN 2025.pdf",
+        "Drawings/Addendum 01 JAN 2025.pdf",
+    ):
+        path = _touch(tmp_path / relative)
+        result = classify_file(path, root=tmp_path)
+        assert result is not None, relative
+        assert result.category != FileCategory.DRAWING, (relative, result.category, result.reasons)
+        assert result.sheet_number is None, (relative, result.sheet_number)
+    specs = classify_file(_touch(tmp_path / "Drawings" / "Pali CHS_JAN 2025_Specs.pdf"), root=tmp_path)
+    assert specs is not None
+    assert specs.category == FileCategory.SPEC
+    manual = classify_file(_touch(tmp_path / "Project Manual JAN 2025.pdf"), root=tmp_path)
+    assert manual is not None
+    assert manual.category == FileCategory.SPEC
+    addendum = classify_file(_touch(tmp_path / "Drawings" / "Addendum 01 JAN 2025.pdf"), root=tmp_path)
+    assert addendum is not None
+    assert addendum.category == FileCategory.ADDENDA
+
+
 def test_sheet_titled_specifications_stays_a_drawing(tmp_path: Path) -> None:
     path = _touch(tmp_path / "A-101 Wall Specifications.pdf")
     result = classify_file(path, root=tmp_path)

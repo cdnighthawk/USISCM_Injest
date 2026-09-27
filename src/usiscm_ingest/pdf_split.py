@@ -8,6 +8,15 @@ Drawings API.
 When an estimate folder already exists, sheets are also copied to
 ``<folder>\\02_Processed\\drawings``. This module never creates an
 ``Estimates`` root.
+
+Each page is split on its own. A MuPDF stack overflow on one page is retried
+on a fresh document, then extracted with pikepdf (when installed) or pypdf.
+That page is skipped and logged if every backend fails. The rest of the set
+is still returned.
+
+Each written sheet is rewritten with unused objects removed. A page resource
+dictionary often names images and fonts for the whole set; saving without
+that cleanup stores the full document in every one-page file.
 """
 
 from __future__ import annotations
@@ -18,7 +27,12 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from usiscm_ingest.classify import ClassifiedFile, FileCategory, is_non_drawing_filename
+from usiscm_ingest.classify import (
+    ClassifiedFile,
+    FileCategory,
+    document_category_for_filename,
+    is_non_drawing_filename,
+)
 from usiscm_ingest.drawing_namer import (
     DrawingName,
     is_sheet_number,
@@ -65,12 +79,30 @@ class PdfSplitError(Exception):
 class PdfInspection:
     readable: bool
     page_count: int
-    pages: list[tuple[Path, str]] = field(default_factory=list)
+    pages: list[tuple[Path, str, int]] = field(default_factory=list)
+    failed_pages: list[int] = field(default_factory=list)
+
+
+_FILENAME_INVALID_RE = re.compile(r'[<>:"/\\|?*]+')
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
 
 
 def _safe_filename(name: str) -> str:
-    cleaned = re.sub(r'[<>:"/\\|?*]+', "-", name).strip(" .")
-    return (cleaned[:180] or "sheet.pdf")
+    """One Windows path segment. Newlines must not become another directory."""
+    text = _CONTROL_RE.sub(" ", name or "")
+    text = _FILENAME_INVALID_RE.sub("-", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    suffix = ""
+    if text.lower().endswith(".pdf"):
+        suffix = ".pdf"
+        text = text[:-4]
+    text = text.strip(" .")
+    if not text:
+        return "sheet.pdf"
+    cleaned = f"{text}{suffix}"
+    if len(cleaned) > 180:
+        cleaned = f"{text[: 180 - len(suffix)].rstrip(' .')}{suffix}"
+    return cleaned or "sheet.pdf"
 
 
 def _work_stem(path: Path) -> str:
@@ -98,8 +130,252 @@ def category_for_page_text(text: str | None) -> FileCategory | None:
     return None
 
 
+def _discard(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _is_mupdf_overflow(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "stack overflow" in text or "recursion" in text
+
+
+def _page_text_mupdf(doc: object, index: int) -> str:
+    page = doc.load_page(index)  # type: ignore[attr-defined]
+    return page.get_text("text") or ""
+
+
+# Keep only the objects this page actually paints. garbage collects objects
+# that clean() dropped from the resource dictionary; deflate packs the rest.
+_COMPACT_SAVE = {"garbage": 4, "clean": True, "deflate": True}
+
+
+def _save_compact(doc: object, out: Path) -> None:
+    doc.save(out, **_COMPACT_SAVE)  # type: ignore[attr-defined]
+
+
+def _write_page_mupdf(doc: object, index: int, out: Path) -> None:
+    import pymupdf
+
+    single = pymupdf.open()
+    try:
+        # Links, annotations, and widgets can point at other pages and pull
+        # those pages' objects into this file.
+        single.insert_pdf(
+            doc,
+            from_page=index,
+            to_page=index,
+            links=False,
+            annots=False,
+            widgets=False,
+        )
+        _save_compact(single, out)
+    finally:
+        single.close()
+
+
+def _compact_page_file(path: Path) -> None:
+    """Rewrite a one-page PDF so unused resources are not stored."""
+    import pymupdf
+
+    doc = pymupdf.open(path)
+    tmp = path.with_name(path.name + ".compact")
+    try:
+        _save_compact(doc, tmp)
+    finally:
+        doc.close()
+    tmp.replace(path)
+
+
+def _try_compact_page_file(path: Path) -> None:
+    """Compact a fallback extract. Keep the uncompacted file if the rewrite fails.
+
+    The caller still rejects a file that is about as large as the whole set.
+    """
+    try:
+        _compact_page_file(path)
+    except Exception as exc:
+        logger.warning("could not rewrite %s to drop unused objects: %s", path.name, exc)
+        _discard(path.with_name(path.name + ".compact"))
+
+
+def _mupdf_export_page(doc: object, index: int, out: Path) -> str:
+    text = _page_text_mupdf(doc, index)
+    _write_page_mupdf(doc, index, out)
+    return text
+
+
+def _reopen_mupdf(path: Path, doc: object) -> object:
+    import pymupdf
+
+    try:
+        doc.close()  # type: ignore[attr-defined]
+    except Exception:
+        logger.debug("closing MuPDF document after split failure", exc_info=True)
+    return pymupdf.open(path)
+
+
+def _split_page_pikepdf(path: Path, index: int, out: Path) -> str:
+    import pikepdf
+
+    with pikepdf.open(path) as pdf:
+        dest = pikepdf.Pdf.new()
+        dest.pages.append(pdf.pages[index])
+        dest.save(out)
+    _try_compact_page_file(out)
+    return ""
+
+
+def _split_page_pypdf(path: Path, index: int, out: Path) -> str:
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(str(path), strict=False)
+    page = reader.pages[index]
+    writer = PdfWriter()
+    writer.add_page(page)
+    with out.open("wb") as handle:
+        writer.write(handle)
+    _try_compact_page_file(out)
+    try:
+        return page.extract_text() or ""
+    except Exception as exc:
+        logger.debug("pypdf text extraction failed for page %s of %s: %s", index + 1, path.name, exc)
+        return ""
+
+
+def _fallback_split_page(path: Path, index: int, out: Path) -> str:
+    """Copy one page without MuPDF. pikepdf when present, then pypdf."""
+    errors: list[str] = []
+    for name, writer in (("pikepdf", _split_page_pikepdf), ("pypdf", _split_page_pypdf)):
+        try:
+            return writer(path, index, out)
+        except ImportError:
+            continue
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+            _discard(out)
+    detail = "; ".join(errors) or "no fallback PDF library available"
+    raise PdfSplitError(path.name, detail)
+
+
+def _close_mupdf(doc: object | None) -> None:
+    if doc is None:
+        return
+    try:
+        doc.close()  # type: ignore[attr-defined]
+    except Exception:
+        logger.debug("closing MuPDF document", exc_info=True)
+
+
+def _open_mupdf(path: Path) -> object | None:
+    import pymupdf
+
+    try:
+        return pymupdf.open(path)
+    except Exception as exc:
+        logger.warning("could not reopen %s: %s", path.name, exc)
+        return None
+
+
+def _reopen_or_drop(path: Path, doc: object | None) -> object | None:
+    if doc is None:
+        return None
+    try:
+        return _reopen_mupdf(path, doc)
+    except Exception as exc:
+        logger.warning("could not reopen %s after MuPDF failure: %s", path.name, exc)
+        return None
+
+
+def _sheet_is_whole_document(out: Path, source: Path, page_count: int) -> bool:
+    """True when a one-page file still weighs almost as much as the whole set."""
+    if page_count < 3:
+        return False
+    try:
+        out_size = out.stat().st_size
+        source_size = source.stat().st_size
+    except OSError:
+        return False
+    if source_size <= 0:
+        return False
+    return out_size > int(source_size * 0.85)
+
+
+def _export_one_page(
+    path: Path,
+    doc: object | None,
+    index: int,
+    out: Path,
+    *,
+    page_count: int,
+) -> tuple[str | None, object | None]:
+    """Write one page. Returns ``(text, doc)`` or ``(None, doc)`` when it failed.
+
+    MuPDF is tried once. A non-overflow error is retried on a freshly opened
+    document in case the previous page left the interpreter unusable. Stack
+    overflow is treated as a property of that page and goes straight to the
+    fallback splitter. The returned document is safe to use for the next page.
+    """
+    errors: list[str] = []
+    page_number = index + 1
+    if doc is not None:
+        for attempt in (1, 2):
+            try:
+                text = _mupdf_export_page(doc, index, out)
+                if _sheet_is_whole_document(out, path, page_count):
+                    raise RuntimeError(
+                        f"page file is {out.stat().st_size} bytes, "
+                        f"near the full {path.stat().st_size}-byte document"
+                    )
+                if attempt == 2:
+                    logger.info("MuPDF split recovered on retry for page %s of %s", page_number, path.name)
+                return text, doc
+            except Exception as exc:
+                errors.append(f"mupdf: {exc}")
+                _discard(out)
+                logger.warning(
+                    "MuPDF could not split page %s of %s (attempt %s): %s",
+                    page_number,
+                    path.name,
+                    attempt,
+                    exc,
+                )
+                doc = _reopen_or_drop(path, doc)
+                # Overflow on this page will not succeed on a second MuPDF pass.
+                if doc is None or _is_mupdf_overflow(exc):
+                    break
+    # Drop the MuPDF handle before the other parser opens the same file.
+    # On Windows the source stays locked until MuPDF closes it.
+    _close_mupdf(doc)
+    try:
+        text = _fallback_split_page(path, index, out)
+        if _sheet_is_whole_document(out, path, page_count):
+            raise RuntimeError(
+                f"fallback page file is {out.stat().st_size} bytes, "
+                f"near the full {path.stat().st_size}-byte document"
+            )
+    except Exception as exc:
+        errors.append(f"fallback: {exc}")
+        _discard(out)
+        logger.error("could not split page %s of %s: %s", page_number, path.name, "; ".join(errors))
+        return None, _open_mupdf(path)
+    logger.warning(
+        "split page %s of %s with fallback after MuPDF failed (%s)",
+        page_number,
+        path.name,
+        "; ".join(errors) or "mupdf unavailable",
+    )
+    return text, _open_mupdf(path)
+
+
 def inspect_pdf(path: Path, dest_dir: Path) -> PdfInspection:
-    """Open a PDF. Multi-page files are written as one PDF per page."""
+    """Open a PDF. Multi-page files are written as one PDF per page.
+
+    A failure on one page does not discard the pages that already split.
+    ``failed_pages`` lists the 1-based page numbers that could not be written.
+    """
     if path.suffix.lower() != ".pdf":
         return PdfInspection(False, 0)
     try:
@@ -112,33 +388,48 @@ def inspect_pdf(path: Path, dest_dir: Path) -> PdfInspection:
     except Exception as exc:
         logger.debug("not a readable PDF %s: %s", path, exc)
         return PdfInspection(False, 0)
+    current: object | None = doc
     try:
         count = int(doc.page_count)
         if count <= 0:
             return PdfInspection(True, 0)
         if count == 1:
-            text = doc.load_page(0).get_text("text") or ""
-            return PdfInspection(True, 1, [(path, text)])
+            try:
+                text = _page_text_mupdf(doc, 0)
+            except Exception as exc:
+                logger.warning("could not read text on page 1 of %s: %s", path.name, exc)
+                text = ""
+            return PdfInspection(True, 1, [(path, text, 1)])
         dest_dir.mkdir(parents=True, exist_ok=True)
-        pages: list[tuple[Path, str]] = []
+        pages: list[tuple[Path, str, int]] = []
+        failed: list[int] = []
         stem = _work_stem(path)
         for index in range(count):
-            text = doc.load_page(index).get_text("text") or ""
-            single = pymupdf.open()
-            try:
-                single.insert_pdf(doc, from_page=index, to_page=index)
-                out = dest_dir / f"{stem}__sheet-{index + 1:04d}.pdf"
-                single.save(out)
-            except Exception as exc:
-                raise PdfSplitError(path.name, f"could not split page {index + 1} of {path.name}: {exc}") from exc
-            finally:
-                single.close()
-            pages.append((out, text))
-        if len(pages) != count:
-            raise PdfSplitError(path.name, f"split {path.name} produced {len(pages)} of {count} pages")
-        return PdfInspection(True, count, pages)
+            out = dest_dir / f"{stem}__sheet-{index + 1:04d}.pdf"
+            text, current = _export_one_page(path, current, index, out, page_count=count)
+            if text is None:
+                failed.append(index + 1)
+                continue
+            pages.append((out, text, index + 1))
+        if count > 1 and not pages:
+            listed = ", ".join(str(number) for number in failed) or "all"
+            raise PdfSplitError(path.name, f"could not split any page of {path.name}; failed pages: {listed}")
+        if failed:
+            logger.error(
+                "split %s skipped page(s) %s",
+                path.name,
+                ", ".join(str(number) for number in failed),
+            )
+        return PdfInspection(True, count, pages, failed)
     finally:
-        doc.close()
+        if current is not None:
+            current.close()
+
+
+def _filename_text(value: str) -> str:
+    text = _CONTROL_RE.sub(" ", value or "")
+    text = _FILENAME_INVALID_RE.sub("-", text)
+    return re.sub(r"\s+", " ", text).strip(" .")
 
 
 def sheet_output_name(named: DrawingName, page_index: int, parent: Path) -> str:
@@ -147,8 +438,8 @@ def sheet_output_name(named: DrawingName, page_index: int, parent: Path) -> str:
     if not number:
         stem = _work_stem(parent)
         return _safe_filename(f"{stem}__page-{page_index + 1:04d}.pdf")
-    stem = number.replace("/", "-")
-    title = named.sheet_title or ""
+    stem = _filename_text(number).replace("/", "-").replace(" ", "")
+    title = _filename_text(named.sheet_title or "")
     if title and title.upper().replace(" ", "") != number.upper().replace(" ", ""):
         slug = re.sub(r"[^A-Za-z0-9]+", "-", title).strip("-")[:40]
         if slug and not slug.lower().startswith("page"):
@@ -156,15 +447,19 @@ def sheet_output_name(named: DrawingName, page_index: int, parent: Path) -> str:
     return _safe_filename(f"{stem}.pdf")
 
 
-def _unique_name(candidate: str, used: set[str]) -> str:
+def _unique_name(candidate: str, used: set[str], *, page_index: int) -> str:
+    candidate = _safe_filename(candidate)
     if candidate not in used:
         used.add(candidate)
         return candidate
-    path = Path(candidate)
-    stem, suffix = path.stem, path.suffix
-    n = 2
+    suffix = ".pdf" if candidate.lower().endswith(".pdf") else ""
+    stem = candidate[: -len(suffix)] if suffix else candidate
+    page = f"__p{page_index + 1:04d}"
+    n = 1
     while True:
-        name = f"{stem}__{n}{suffix}"
+        extra = page if n == 1 else f"{page}__{n}"
+        room = 180 - len(extra) - len(suffix)
+        name = _safe_filename(f"{stem[:room].rstrip(' .')}{extra}{suffix}")
         if name not in used:
             used.add(name)
             return name
@@ -211,7 +506,12 @@ def _name_page(
     )
 
 
-def expand_drawing_file(item: ClassifiedFile, dest_dir: Path) -> list[ClassifiedFile]:
+def expand_drawing_file(
+    item: ClassifiedFile,
+    dest_dir: Path,
+    *,
+    failures: list[str] | None = None,
+) -> list[ClassifiedFile]:
     """One uploadable file per sheet.
 
     Single-page files and non-PDFs pass through. A multi-page drawing PDF
@@ -220,15 +520,24 @@ def expand_drawing_file(item: ClassifiedFile, dest_dir: Path) -> list[Classified
     other non-drawing filenames are retagged without being split onto Drawings.
     """
     origin = item.origin_path or str(item.path)
-    if is_non_drawing_filename(item.path.name) and item.category == FileCategory.DRAWING:
-        renamed = _copy_item(
-            item,
-            category=_document_category(item.path.name),
-            sheet_number=None,
-            origin_path=origin,
-            reasons=[*item.reasons, "non-drawing file kept off the drawings path"],
-        )
-        return [renamed]
+    # Specs, addenda, manuals, and other non-drawings stay the original
+    # multi-page PDF. A Drawings folder must not pull a spec book onto sheets.
+    if item.category != FileCategory.DRAWING or is_non_drawing_filename(item.path.name):
+        category = item.category
+        reasons = list(item.reasons)
+        if is_non_drawing_filename(item.path.name):
+            category = document_category_for_filename(item.path.name)
+            reasons = [*reasons, "non-drawing file kept off the drawings path"]
+        return [
+            _copy_item(
+                item,
+                category=category,
+                sheet_number=None if category != FileCategory.DRAWING else item.sheet_number,
+                origin_path=origin,
+                reasons=reasons,
+                from_split=False,
+            )
+        ]
 
     if item.path.suffix.lower() != ".pdf":
         if not item.origin_path:
@@ -236,6 +545,9 @@ def expand_drawing_file(item: ClassifiedFile, dest_dir: Path) -> list[Classified
         return [item]
 
     info = inspect_pdf(item.path, dest_dir / _work_stem(item.path))
+    if info.failed_pages and failures is not None:
+        pages = ", ".join(str(number) for number in info.failed_pages)
+        failures.append(f"could not split page(s) {pages} of {item.path.name}")
     if not info.readable or info.page_count <= 1:
         text = info.pages[0][1] if info.pages else item.page_text
         named = _name_page(parent=item, filename=item.path.name, page_text=text or "", from_split=False)
@@ -255,11 +567,15 @@ def expand_drawing_file(item: ClassifiedFile, dest_dir: Path) -> list[Classified
 
     used: set[str] = set()
     outputs: list[ClassifiedFile] = []
-    for index, (pdf, text) in enumerate(info.pages):
+    for pdf, text, page_number in info.pages:
         named = _name_page(parent=item, filename=item.path.name, page_text=text, from_split=True)
         page_category = category_for_page_text(text)
         category = page_category or FileCategory.DRAWING
-        filename = _unique_name(sheet_output_name(named, index, item.path), used)
+        filename = _unique_name(
+            sheet_output_name(named, page_number - 1, item.path),
+            used,
+            page_index=page_number - 1,
+        )
         final = pdf.with_name(filename)
         if final != pdf:
             pdf.rename(final)
@@ -273,7 +589,7 @@ def expand_drawing_file(item: ClassifiedFile, dest_dir: Path) -> list[Classified
                 relative_path=_relative(item.relative_path, final.name),
                 category=category,
                 confidence=item.confidence,
-                reasons=[*item.reasons, f"split page {index + 1} of {info.page_count} from {item.path.name}"],
+                reasons=[*item.reasons, f"split page {page_number} of {info.page_count} from {item.path.name}"],
                 sheet_number=named.sheet_number if category == FileCategory.DRAWING else None,
                 size_bytes=size,
                 page_text=text,
@@ -283,17 +599,6 @@ def expand_drawing_file(item: ClassifiedFile, dest_dir: Path) -> list[Classified
         )
     logger.info("Split %s into %d sheet PDF(s)", item.path.name, len(outputs))
     return outputs
-
-
-def _document_category(filename: str) -> FileCategory:
-    stem = Path(filename).stem
-    if re.search(r"addend|bulletin", stem, re.I):
-        return FileCategory.ADDENDA
-    if re.search(r"spec|project\s+manual|manual", stem, re.I):
-        return FileCategory.SPEC
-    if re.search(r"rfp|rfq|bid|w-?\s*9|proposal", stem, re.I):
-        return FileCategory.BID_INSTRUCTIONS
-    return FileCategory.OTHER
 
 
 def _leaf_name(path: Path) -> str:

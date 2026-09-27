@@ -86,3 +86,51 @@ def test_refresh_and_cache_round_trip(tmp_path: Path) -> None:
 def test_tokens_from_endpoint_requires_access_token() -> None:
     with pytest.raises(MicrosoftAuthError):
         tokens_from_endpoint({"error_description": "nope"})
+
+
+def test_near_expiry_cache_refreshes_without_a_prompt(tmp_path: Path) -> None:
+    path = tmp_path / "ms_tokens.json"
+    save_tokens(
+        path,
+        MicrosoftTokens(
+            access_token="old",
+            refresh_token="rtok",
+            expires_at=time.time() + 30,
+            tenant_id="tenant",
+            client_id="client",
+        ),
+    )
+    response = MagicMock()
+    response.ok = True
+    response.json.return_value = {"access_token": "new", "refresh_token": "rtok2", "expires_in": 3600}
+    with patch("usiscm_ingest.microsoft.requests.post", return_value=response) as posted:
+        with patch("usiscm_ingest.microsoft.device_code_login") as device:
+            from usiscm_ingest.microsoft import resolve_microsoft_tokens
+
+            tokens = resolve_microsoft_tokens(EntraApp("tenant", "client"), token_path=path, interactive=False)
+    device.assert_not_called()
+    assert tokens.access_token == "new"
+    assert tokens.refresh_token == "rtok2"
+    assert posted.call_args.kwargs["data"]["grant_type"] == "refresh_token"
+    assert load_tokens(path) is not None
+    assert load_tokens(path).access_token == "new"  # type: ignore[union-attr]
+
+
+def test_fresh_cache_is_reused(tmp_path: Path) -> None:
+    path = tmp_path / "ms_tokens.json"
+    save_tokens(
+        path,
+        MicrosoftTokens(
+            access_token="still-good",
+            refresh_token="rtok",
+            expires_at=time.time() + 7200,
+            tenant_id="tenant",
+            client_id="client",
+        ),
+    )
+    from usiscm_ingest.microsoft import resolve_microsoft_tokens
+
+    with patch("usiscm_ingest.microsoft.requests.post") as posted:
+        tokens = resolve_microsoft_tokens(EntraApp("tenant", "client"), token_path=path, interactive=False)
+    posted.assert_not_called()
+    assert tokens.access_token == "still-good"

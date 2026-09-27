@@ -6,14 +6,14 @@ This is the same upload path the USIS PDF app uses: the website stores the catal
 
 Multi-page **drawing** PDFs are split on this PC into one PDF per sheet before native B2 upload. Sheet number, title, discipline, set, and revision are read from that sheet's title block (and, for a file that is already one sheet, from the filename and folder, such as `A1-001_BCK-1.pdf` under `Architectural/Permit-Set/`). Package and form tokens (`PKG1`, `ADD01`, `NO.4`, `W9`) are not sheet numbers. If the name is missing or does not look like a real sheet id, the sheet **still uploads** and a review item is posted to `POST /api/v1/ingest/errors` so it appears in the CM ingest tracker when someone opens the app.
 
-Specs, addenda, bid forms, W-9s, RFP/RFQ, manuals, and combined bid sets go to the documents API only. They are not sheet-split onto the Drawings page.
+Only real drawing PDFs are sheet-split. Specs, specifications, project manuals, addenda, bid forms, W-9s, RFP/RFQ, manuals, and combined bid sets stay the original multi-page PDF and go to the documents API only. A name or path like `Pali CHS_JAN 2025_Specs` or `Pali_CHS_JAN_2025_Specs` is a spec book even when it sits in a Drawings folder. A date token such as `JAN 2025` is not a sheet number. They are not sheet-split and they do not get drawing rows. A single sheet whose filename is a real sheet id, such as `A-101 Wall Specifications`, is still a drawing.
 
 GC offices do **not** share one package layout. A Turner progress-print zip, a numbered Swinerton folder tree, and a flat Webcor dump are all valid. The importer never requires a project-name pattern, `Progress Print` suffix, or revision scheme. It scores each file as:
 
 | Category | Typical signals (none required) |
 | --- | --- |
 | `drawing` | Sheet numbers (`A-101`, `S2.01`), `.dwg`/`.dxf`, folders like Drawings/Plans |
-| `spec` | Project manual / specification wording, CSI section numbers (`09 29 00`) |
+| `spec` | `Specs`, specification, project manual, CSI section numbers (`09 29 00`) |
 | `bid_instructions` | ITB, instructions to bidders, bid form, Division 00 |
 | `addenda` | Addendum / bulletin / ASI |
 | `report` | Geotech, soils, survey, environmental |
@@ -28,7 +28,7 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-Sheet split uses PyMuPDF, which is installed with the package. `--peek-pdf` / `USISCM_SHEET_AI` still control first-page classification text and the website title-block AI.
+Sheet split uses PyMuPDF, which is installed with the package, and falls back to pypdf for a page MuPDF cannot extract. `--peek-pdf` / `USISCM_SHEET_AI` still control first-page classification text and the website title-block AI.
 
 Copy `.env.example` to `.env` on the **server**. Night jobs do not open a Microsoft login.
 
@@ -123,7 +123,11 @@ Install this version on the data server, then force one job (for example ACC pro
 usiscm-ingest watch --once --reprocess --package 26092
 ```
 
-That re-reads the ACCDocs package whose path contains `26092`, splits multi-page drawing PDFs, uploads each sheet to native B2, and sends addenda, specs, W-9s, RFPs, manuals, and combined bid sets to documents only.
+That re-reads the ACCDocs package whose path contains `26092`, sheet-splits multi-page drawing PDFs only, uploads each sheet to native B2, and uploads specs, project manuals, addenda, W-9s, RFPs, and other non-drawings as the original multi-page file on documents only.
+
+A long `watch`, `import`, `reprocess`, or specialty run does not ask Charles to sign in. After the one-time daytime `usiscm-ingest login`, the saved refresh token silently renews the access token before each website call when it is inside 15 minutes of expiry (or inside one upload timeout, whichever is longer). Catalog create, B2 mint, ack, and document posts that return `401` refresh once and retry that same request. Device-code login is not used. If the refresh token is missing or Microsoft rejects it, the job logs that and exits. The ingest API key does not expire; a `401` on that key retries only if `USISCM_INGEST_API_KEY` was changed in the environment.
+
+Sheet split is per page. Each sheet is rewritten so unused images, fonts, and other objects from the rest of the set are not stored in that file. A one-page sheet must stay far smaller than the source PDF. Sheet titles used as filenames are Windows-safe: newlines, tabs, other control characters, and `<>:"/\|?*` are removed so a title cannot create another folder or an illegal path. A name that collides after that cleanup gets the page index. If MuPDF hits a stack overflow on one page, that page is extracted with pypdf (or pikepdf when it is installed) and rewritten the same way. The other pages still upload. A page that cannot be extracted as a compact one-page PDF is logged by page number and omitted. The run reports those pages, uploads the sheets that did split, and does not send the original multi-page PDF as one drawing.
 
 To also drop the sheets into an estimate folder that is already on disk:
 

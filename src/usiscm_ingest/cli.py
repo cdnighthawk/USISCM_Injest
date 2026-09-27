@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from usiscm_ingest.client import UsiscmClient, UsiscmError
+from usiscm_ingest.client import UnattendedAuthError, UsiscmClient, UsiscmError
 from usiscm_ingest.config import load_settings
 from usiscm_ingest.microsoft import (
     MicrosoftAuthError,
@@ -348,6 +348,8 @@ def _cmd_watch(args: argparse.Namespace) -> int:
                     pending.write_json(
                         dest.with_suffix(dest.suffix + ".manifest.json") if dest.is_file() else dest / "manifest.json"
                     )
+            except UnattendedAuthError:
+                raise
             except (UsiscmError, OSError) as exc:
                 logger.error("Failed %s: %s", package, exc)
                 status = 1
@@ -360,13 +362,17 @@ def _cmd_watch(args: argparse.Namespace) -> int:
                     pass
         return status
 
-    if args.once:
-        return run_once()
+    try:
+        if args.once:
+            return run_once()
 
-    logger.info("Watching %s every %ss", drop, interval)
-    while True:
-        run_once()
-        time.sleep(interval)
+        logger.info("Watching %s every %ss", drop, interval)
+        while True:
+            run_once()
+            time.sleep(interval)
+    except UnattendedAuthError as exc:
+        logger.error("%s", exc)
+        return 2
 
 
 def _cmd_specialty_run(args: argparse.Namespace) -> int:

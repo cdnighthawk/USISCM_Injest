@@ -122,6 +122,7 @@ DEFAULT_HINTS: dict[FileCategory, CategoryHints] = {
         filenames=(
             "specification",
             "specifications",
+            "specs",
             "spec book",
             "project manual",
             "projectmanual",
@@ -305,10 +306,23 @@ _HARD_DOCUMENT_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 # Spec books without a real sheet id. "A-101 Wall Specifications" stays a drawing.
+# "Specs" is the token on Pali_CHS_JAN_2025_Specs; "specification(s)" does not match it.
 _SPEC_BOOK_NAME_RE = re.compile(
-    r"\bspecifications?\b|\bspec\s*book\b|\btechnical\s+specs?\b",
+    r"\bspecifications?\b|\bspecs?\b|\bspec\s*book\b|\btechnical\s+specs?\b",
     re.IGNORECASE,
 )
+
+
+def document_category_for_filename(filename: str | None) -> FileCategory:
+    """Document class for a non-drawing name. Specs stay specifications."""
+    stem = _normalize(Path(filename or "").stem)
+    if re.search(r"\baddend|\bbulletins?\b", stem):
+        return FileCategory.ADDENDA
+    if _SPEC_BOOK_NAME_RE.search(stem) or re.search(r"\bproject\s+manual\b|\bmanuals?\b", stem):
+        return FileCategory.SPEC
+    if re.search(r"\brfp\b|\brfq\b|\bbid\b|\bw\s?9\b|\bproposal\b", stem):
+        return FileCategory.BID_INSTRUCTIONS
+    return FileCategory.OTHER
 
 
 def is_non_drawing_filename(filename: str | None) -> bool:
@@ -319,6 +333,8 @@ def is_non_drawing_filename(filename: str | None) -> bool:
     blob = f"{stem}\n{_normalize(stem)}"
     if _HARD_DOCUMENT_NAME_RE.search(blob):
         return True
+    # A date such as JAN 2025 is not a sheet id, so it must not keep a spec
+    # book on the drawings path. A real id (A-101) still wins.
     if _SPEC_BOOK_NAME_RE.search(blob) and not find_sheet_number(stem):
         return True
     return False
@@ -469,7 +485,11 @@ def classify_file(
             if f"sheet number {sheet_hit}" not in best_reasons:
                 best_reasons = [f"sheet number {sheet_hit}", *best_reasons]
 
-    if best_score == 0 and non_drawing_name:
+    if non_drawing_name and best_category == FileCategory.DRAWING:
+        best_category = document_category_for_filename(path.name)
+        best_reasons = ["non-drawing filename kept off the drawings path", *best_reasons]
+    elif best_score == 0 and non_drawing_name:
+        best_category = document_category_for_filename(path.name)
         best_reasons = ["non-drawing document (addendum, spec, bid set, W-9, RFP, or manual)"]
     elif best_score == 0 and suffix not in DRAWING_EXTENSIONS | DOCUMENT_EXTENSIONS | {".mpp", ".xer"}:
         best_reasons = ["unrecognized file type"]
