@@ -3,13 +3,13 @@
 Drawings and other documents follow the USISPdfApp path: catalog row on the
 website, file bytes straight to native B2, then a metadata-only ack.
 Render never receives the file. Multi-page drawing PDFs are split on this
-machine into one PDF per sheet before that upload. Specs, addenda, bid forms,
-W-9s, manuals, and combined bid sets stay on the documents path. Spec manuals
-are also sent to the Spec_Parser CLI when an estimate folder exists; CSI
-section PDFs are written under that folder and are not uploaded as drawings.
-Automatic
-drawing names never wait for a person; ambiguous names still upload and are
-logged on ``/api/v1/ingest/errors`` so they show up in the CM ingest tracker.
+machine into one PDF per sheet before that upload. Specs are never sheet-split.
+After Spec_Parser ``--by section``, each CSI section PDF is uploaded to the
+Specs table the same way (native B2, no bytes through Render). Other
+non-drawing files stay on Documents. If Spec_Parser or the Specs mint is
+missing, the whole manual stays one specification document.
+Automatic drawing names never wait for a person; ambiguous names still upload
+and are logged on ``/api/v1/ingest/errors`` so they show up in the CM ingest tracker.
 A long run refreshes the Microsoft access token before it expires and retries
 a website call once after a 401.
 """
@@ -63,7 +63,7 @@ from usiscm_ingest.pdf_split import (
     expand_drawing_file,
     resolve_estimate_folder,
 )
-from usiscm_ingest.spec_parser import parse_spec_documents
+from usiscm_ingest.spec_parser import SpecSectionPdf, list_section_pdfs, parse_spec_documents
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +135,7 @@ class UploadResult:
     issues: list[dict[str, Any]] = field(default_factory=list)
     batch_id: str = ""
     spec_splits: list[dict[str, Any]] = field(default_factory=list)
+    specs_api_gap: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -146,6 +147,7 @@ class UploadResult:
             "issues": self.issues,
             "batch_id": self.batch_id,
             "spec_splits": self.spec_splits,
+            "specs_api_gap": self.specs_api_gap,
         }
 
 
@@ -326,8 +328,8 @@ class UsiscmClient:
                 manifest, Path(tmp), result, report_failures=not dry_run
             )
             documents = self._document_items(manifest, result) + rerouted
-            # Specs are already documents. Section PDFs stay on disk under the
-            # estimate folder and are not added to ``drawings``.
+            # Specs are multipage. Sheet-split never sees them. Spec_Parser
+            # writes CSI section PDFs (still multipage) under the estimate folder.
             if not dry_run:
                 try:
                     result.spec_splits = parse_spec_documents(documents, estimate_dir)
@@ -336,6 +338,9 @@ class UsiscmClient:
                         "Spec_Parser step failed (%s); keeping spec PDFs as documents",
                         exc,
                     )
+                documents = self._upload_spec_sections(
+                    project, result, documents, manifest.label
+                )
             if dry_run:
                 named = [_name_item(item).to_dict() for item in drawings]
                 result.details.append(
@@ -683,7 +688,7 @@ class UsiscmClient:
         api: str = "v1",
     ) -> dict[str, Any]:
         http = session or self.session
-        collection = "documents" if kind == "document" else "drawings"
+        collection = _b2_collection(kind)
         if api == "v1":
             path = f"api/v1/{collection}/{row_id}/upload-session"
         else:
@@ -765,7 +770,7 @@ class UsiscmClient:
             session=http,
             api=api,
         )
-        collection = "documents" if kind == "document" else "drawings"
+        collection = _b2_collection(kind)
         if api == "v1":
             ack_path = f"api/v1/{collection}/{row_id}/ack-file"
         else:
@@ -788,7 +793,7 @@ class UsiscmClient:
         )
         ack_payload = _json(ack)
         if not ack.ok:
-            label = "document" if kind == "document" else "drawing"
+            label = {"document": "document", "spec": "spec section"}.get(kind, "drawing")
             raise UsiscmError(_error_text(ack_payload) or f"{label} ack failed ({ack.status_code})")
 
     def _upload_drawing_ingest_key(self, project_id: str, item, named: DrawingName, label: str) -> dict[str, Any]:
@@ -845,6 +850,184 @@ class UsiscmClient:
             "filename": item.path.name,
             "imported": 1,
             "drawing_id": drawing_id,
+            "errors": [],
+        }
+
+    def _upload_spec_sections(
+        self,
+        project: dict[str, Any],
+        result: UploadResult,
+        documents: list,
+        label: str,
+    ) -> list:
+        """Upload CSI section PDFs to the Specs table. Never Drawings or Documents.
+
+        A missing Spec_Parser already left the whole manual in ``documents``.
+        When sections exist, each PDF is posted as metadata plus a native B2
+        upload. CM_Deploy does not yet mint a Specs upload URL (the live file
+        route is multipart and would send bytes through Render). A 404/405/501
+        on the Specs create is a gap: sections stay on disk, the whole manual
+        stays a specification document, and the batch continues.
+        """
+        sections = _sections_from_splits(result.spec_splits)
+        if not sections:
+            return documents
+        by_source: dict[str, list[dict[str, Any]]] = {}
+        for section in sections:
+            if result.specs_api_gap:
+                break
+            detail = self._upload_spec_section(project, section, label, batch_id=result.batch_id)
+            result.details.append(detail)
+            by_source.setdefault(_path_key(section.source_pdf), []).append(detail)
+            if detail.get("gap"):
+                result.specs_api_gap = str(detail.get("message") or "")
+                logger.warning("%s", result.specs_api_gap)
+        if result.specs_api_gap:
+            return documents
+        replaced = {
+            source
+            for source, details in by_source.items()
+            if details and all(int(item.get("imported") or 0) == 1 for item in details)
+        }
+        if not replaced:
+            return documents
+        kept = []
+        for item in documents:
+            if item.category == FileCategory.SPEC and _path_key(item.path) in replaced:
+                logger.info(
+                    "Spec manual %s is on the Specs table as CSI sections; not also posted as a document",
+                    item.path.name,
+                )
+                continue
+            kept.append(item)
+        return kept
+
+    def _upload_spec_section(
+        self,
+        project: dict[str, Any],
+        section: SpecSectionPdf,
+        label: str,
+        *,
+        batch_id: str,
+    ) -> dict[str, Any]:
+        self._ensure_auth()
+        project_id = str(project.get("id") or project.get("project_id") or "")
+        try:
+            if self.uses_microsoft:
+                return self._upload_spec_native_b2(project, section, label)
+            return self._upload_spec_ingest_key(project_id, section, label)
+        except UnattendedAuthError:
+            raise
+        except (UsiscmError, B2Error, OSError) as exc:
+            self.report_issue(
+                message=str(exc),
+                relative_path=section.path.name,
+                filename=section.path.name,
+                kind="spec",
+                batch_id=batch_id,
+                project_id=project_id,
+                project_number=_project_number(project),
+                detail={"code": section.code, "title": section.title},
+            )
+            return {
+                "endpoint": "spec-sections",
+                "filename": section.path.name,
+                "source_pdf": section.source_pdf,
+                "imported": 0,
+                "error": str(exc),
+            }
+
+    def _upload_spec_native_b2(self, project: dict[str, Any], section: SpecSectionPdf, label: str) -> dict[str, Any]:
+        job_id = _job_id(project)
+        if not job_id:
+            raise UsiscmError("project has no job id for native B2 spec create")
+        return self._post_spec_section(
+            section,
+            url=self._url(f"api/v1/jobs/{job_id}/spec-sections"),
+            http=self.session,
+            api="v1",
+            body={
+                "item": {
+                    "code": section.code,
+                    "title": section.title or label,
+                    "sourceFileName": section.path.name,
+                    "contentHash": sha256_hex(section.path.read_bytes()),
+                    "mimeType": "application/pdf",
+                }
+            },
+            endpoint="b2-native",
+        )
+
+    def _upload_spec_ingest_key(self, project_id: str, section: SpecSectionPdf, label: str) -> dict[str, Any]:
+        http = self.ingest_session if self.uses_microsoft and self.settings.ingest_api_key else self.session
+        payload = section.path.read_bytes()
+        return self._post_spec_section(
+            section,
+            url=self._url("api/spec-sections"),
+            http=http,
+            api="ingest",
+            body={
+                "project_id": project_id,
+                "code": section.code,
+                "title": section.title or label,
+                "filename": section.path.name,
+                "sourceFileName": section.path.name,
+                "content_hash": sha256_hex(payload),
+                "mimeType": "application/pdf",
+                "source": ISSUE_SOURCE,
+                "sourceSystem": ISSUE_SOURCE,
+            },
+            endpoint="ingest/spec-sections",
+        )
+
+    def _post_spec_section(
+        self,
+        section: SpecSectionPdf,
+        *,
+        url: str,
+        http: requests.Session,
+        api: str,
+        body: dict[str, Any],
+        endpoint: str,
+    ) -> dict[str, Any]:
+        """JSON catalog create, then native B2. Never multipart through Render."""
+        payload = section.path.read_bytes()
+        response = http.post(url, json=body, timeout=self.timeout)
+        created = _json(response)
+        if _specs_endpoint_missing(response):
+            return _spec_api_gap_detail(section, url)
+        if response.status_code not in {200, 201}:
+            raise UsiscmError(_error_text(created) or f"spec section create failed ({response.status_code})")
+        section_id = _row_id(created)
+        if _stored_duplicate(created):
+            return {
+                "endpoint": endpoint,
+                "filename": section.path.name,
+                "source_pdf": section.source_pdf,
+                "code": section.code,
+                "imported": 1,
+                "spec_section_id": section_id,
+                "errors": [],
+            }
+        if not section_id:
+            raise UsiscmError("website accepted the spec section but returned no id")
+        self._complete_b2_upload(
+            http=http,
+            row_id=section_id,
+            created=created,
+            payload=payload,
+            digest=sha256_hex(payload),
+            content_type="application/pdf",
+            kind="spec",
+            api=api,
+        )
+        return {
+            "endpoint": endpoint,
+            "filename": section.path.name,
+            "source_pdf": section.source_pdf,
+            "code": section.code,
+            "imported": 1,
+            "spec_section_id": section_id,
             "errors": [],
         }
 
@@ -1138,6 +1321,55 @@ def _error_text(payload: dict[str, Any] | None) -> str:
     if isinstance(err, str):
         return err.strip()
     return ""
+
+
+def _b2_collection(kind: str) -> str:
+    if kind == "document":
+        return "documents"
+    if kind == "spec":
+        return "spec-sections"
+    return "drawings"
+
+
+def _path_key(path: str | Path) -> str:
+    try:
+        return str(Path(path).resolve())
+    except OSError:
+        return str(path)
+
+
+def _sections_from_splits(splits: list[dict[str, Any]]) -> list[SpecSectionPdf]:
+    found: list[SpecSectionPdf] = []
+    for row in splits:
+        if not row.get("ok") or not row.get("out"):
+            continue
+        found.extend(list_section_pdfs(Path(str(row["out"])), source_pdf=str(row.get("pdf") or "")))
+    return found
+
+
+def _specs_endpoint_missing(response: requests.Response) -> bool:
+    return response.status_code in {404, 405, 501}
+
+
+def _spec_api_gap_detail(section: SpecSectionPdf, url: str) -> dict[str, Any]:
+    """CM_Deploy has spec rows and a multipart file route, not a native B2 mint."""
+    message = (
+        "CM Specs native B2 API is not deployed "
+        f"({url}). CM_Deploy can create spec section rows and accepts a multipart "
+        "PDF at /api/v1/projects/{{id}}/rfi-lookups/spec_sections/{{id}}/file, which "
+        "sends bytes through Render. Ingest will not use that route. "
+        f"{section.path.name} stays under the estimate folder and was not posted to "
+        "Drawings or Documents. The whole manual stays a specification document."
+    )
+    return {
+        "endpoint": "spec-sections",
+        "filename": section.path.name,
+        "source_pdf": section.source_pdf,
+        "code": section.code,
+        "imported": 0,
+        "gap": True,
+        "message": message,
+    }
 
 
 def _upload_hint(payload: dict[str, Any] | None) -> dict[str, Any] | None:

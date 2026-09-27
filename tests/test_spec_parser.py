@@ -17,6 +17,7 @@ from usiscm_ingest.spec_parser import (
     _find_spec_parser_cli,
     _run_spec_parser,
     _should_spec_parse,
+    list_section_pdfs,
     parse_spec_documents,
     spec_parser_dir,
     spec_split_dir,
@@ -367,7 +368,22 @@ def test_import_soft_fails_when_parser_missing_and_keeps_document(
     assert not list((estimate / "02_Processed" / "drawings").glob("*Spec*"))
 
 
-def test_import_writes_section_pdfs_as_documents_not_drawings(
+def test_list_section_pdfs_keeps_division_tree_and_skips_unassigned(tmp_path: Path) -> None:
+    out = tmp_path / "spec_splits" / "Project Manual" / "Project Manual" / "Div 08 - Openings"
+    out.mkdir(parents=True)
+    section = out / "08 11 16 - Aluminum Doors.pdf"
+    section.write_bytes(b"%PDF-section")
+    unassigned = out.parent / "_unassigned"
+    unassigned.mkdir()
+    (unassigned / "notes.pdf").write_bytes(b"%PDF-loose")
+    (out.parent / "split_report.json").write_text("{}", encoding="utf-8")
+    found = list_section_pdfs(tmp_path / "spec_splits", source_pdf="manual.pdf")
+    assert [(item.code, item.title, item.path.name) for item in found] == [
+        ("08 11 16", "Aluminum Doors", "08 11 16 - Aluminum Doors.pdf")
+    ]
+
+
+def test_import_uploads_section_pdfs_to_specs_not_drawings_or_documents(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "Job"
@@ -387,18 +403,94 @@ def test_import_writes_section_pdfs_as_documents_not_drawings(
     monkeypatch.setattr("usiscm_ingest.spec_parser._probe_pdf_kind", lambda _pdf: ("unknown", "test"))
     monkeypatch.setattr("usiscm_ingest.spec_parser._run_spec_parser", fake_run)
     client, document_names, payloads = _client(tmp_path)
+    spec_bodies: list[dict] = []
+    original = client.session.post.side_effect
+
+    def fake_post(url, **kwargs):
+        assert "files" not in kwargs
+        if url.rstrip("/").endswith("/spec-sections"):
+            body = kwargs.get("json") or {}
+            spec_bodies.append(body)
+            response = MagicMock()
+            response.ok = True
+            response.status_code = 201
+            response.headers = {}
+            response.json.return_value = {
+                "item": {"id": "spec-1", "file_pending": True},
+                "upload": {
+                    "mode": "b2_native",
+                    "url": "https://pod.backblaze.com/b2api/v2/b2_upload_file/x",
+                    "authorization": "b2tok",
+                    "file_name": "spec-sections/08-11-16.pdf",
+                },
+            }
+            return response
+        return original(url, **kwargs)
+
+    client.session.post = MagicMock(side_effect=fake_post)
     result = client.import_package(ingest_source(root), project_id="job-1", estimate_folder=str(estimate))
 
     section = estimate / "02_Processed" / "spec_splits" / "Project Manual" / "08 11 16 - Aluminum Doors.pdf"
     assert section.is_file()
     assert result.errors == []
-    assert document_names == ["Project Manual.pdf"]
-    assert "08 11 16 - Aluminum Doors.pdf" not in document_names
+    assert result.specs_api_gap == ""
+    assert document_names == []
+    assert spec_bodies and spec_bodies[0]["code"] == "08 11 16"
+    assert spec_bodies[0]["title"] == "Aluminum Doors"
+    assert spec_bodies[0]["filename"] == "08 11 16 - Aluminum Doors.pdf"
     urls = [call.args[0] for call in client.session.post.call_args_list]
-    assert any(url.endswith("/api/documents") for url in urls)
+    assert any(url.rstrip("/").endswith("/api/spec-sections") for url in urls)
+    assert any(url.endswith("/api/spec-sections/spec-1/ack-file") for url in urls)
     assert any(url.endswith("/api/drawings") for url in urls)
-    assert not any("Aluminum" in url or "spec_splits" in url for url in urls)
-    assert b"%PDF-section" not in payloads
-    assert b"spec-bytes" in payloads
+    assert not any(url.rstrip("/").endswith("/api/documents") for url in urls)
+    assert b"%PDF-section" in payloads
+    assert b"spec-bytes" not in payloads
     assert result.spec_splits[0]["ok"] is True
     assert not (estimate / "02_Processed" / "drawings" / "08 11 16 - Aluminum Doors.pdf").exists()
+
+
+def test_missing_specs_mint_keeps_whole_manual_as_document(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "Job"
+    root.mkdir()
+    (root / "Project Manual.pdf").write_bytes(b"spec-bytes")
+    estimate = tmp_path / "26092"
+    estimate.mkdir()
+
+    def fake_run(pdf: Path, out: Path, **kwargs) -> dict:
+        out.mkdir(parents=True, exist_ok=True)
+        nested = out / pdf.stem / "Div 08 - Openings"
+        nested.mkdir(parents=True)
+        (nested / "08 11 16 - Aluminum Doors.pdf").write_bytes(b"%PDF-section")
+        return {"pdf": str(pdf), "ok": True, "out": str(out)}
+
+    monkeypatch.setattr("usiscm_ingest.spec_parser._probe_pdf_kind", lambda _pdf: ("specs", "test"))
+    monkeypatch.setattr("usiscm_ingest.spec_parser._run_spec_parser", fake_run)
+    client, document_names, payloads = _client(tmp_path)
+    original = client.session.post.side_effect
+
+    def fake_post(url, **kwargs):
+        assert "files" not in kwargs
+        if "spec-sections" in url:
+            response = MagicMock()
+            response.ok = False
+            response.status_code = 404
+            response.headers = {}
+            response.text = "not found"
+            response.json.side_effect = ValueError("not json")
+            return response
+        return original(url, **kwargs)
+
+    client.session.post = MagicMock(side_effect=fake_post)
+    result = client.import_package(ingest_source(root), project_id="job-1", estimate_folder=str(estimate))
+    assert result.errors == []
+    assert result.specs_api_gap
+    assert "not deployed" in result.specs_api_gap
+    assert "Render" in result.specs_api_gap
+    assert document_names == ["Project Manual.pdf"]
+    assert b"spec-bytes" in payloads
+    assert b"%PDF-section" not in payloads
+    urls = [call.args[0] for call in client.session.post.call_args_list]
+    assert any(url.rstrip("/").endswith("/api/spec-sections") for url in urls)
+    assert not any(url.rstrip("/").endswith("/api/drawings") for url in urls)

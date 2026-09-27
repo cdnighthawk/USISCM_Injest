@@ -46,6 +46,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from usiscm_ingest.classify import FileCategory
@@ -79,6 +80,19 @@ _MANUAL_NAME_RE = re.compile(
 )
 _CSI_SECTION_RE = re.compile(r"^\d{2}[\s._-]*\d{2}[\s._-]*\d{2}\b")
 _CSI_FLAT_RE = re.compile(r"^\d{6}\b")
+_SECTION_FILE_RE = re.compile(
+    r"^(?P<a>\d{2})[\s._-]*(?P<b>\d{2})[\s._-]*(?P<c>\d{2})(?:\s*[-–—:]\s*(?P<title>.*))?$"
+)
+
+
+@dataclass(frozen=True)
+class SpecSectionPdf:
+    """One CSI section PDF written by Spec_Parser. It may contain many pages."""
+
+    path: Path
+    code: str
+    title: str
+    source_pdf: str
 
 
 def spec_parser_dir() -> Path | None:
@@ -122,6 +136,40 @@ def spec_parser_python() -> str:
         if raw:
             return raw
     return sys.executable
+
+
+def section_identity(path: Path) -> tuple[str, str] | None:
+    """CSI code and title from ``{number} - {title}.pdf``. ``_unassigned`` is not a section."""
+    if any(part.lower() == "_unassigned" for part in path.parts):
+        return None
+    if path.name.startswith("_"):
+        return None
+    match = _SECTION_FILE_RE.match(path.stem.strip())
+    if not match:
+        return None
+    code = f"{match.group('a')} {match.group('b')} {match.group('c')}"
+    title = (match.group("title") or "").strip() or path.stem.strip()
+    return code, title
+
+
+def list_section_pdfs(out: Path, *, source_pdf: str) -> list[SpecSectionPdf]:
+    """Section PDFs under Spec_Parser's tree, including ``Div NN`` folders.
+
+    Spec_Parser writes ``<out>/<pdf-stem>/Div NN - <name>/{number} - {title}.pdf``
+    plus ``_unassigned/`` and ``split_report.json``. Only real section PDFs are
+    returned. They are not page-split.
+    """
+    if not out.is_dir():
+        return []
+    found: list[SpecSectionPdf] = []
+    for pdf in sorted(out.rglob("*.pdf")):
+        identity = section_identity(pdf)
+        if identity is None:
+            logger.info("Spec_Parser output %s is not a CSI section PDF; left on disk", pdf)
+            continue
+        code, title = identity
+        found.append(SpecSectionPdf(path=pdf, code=code, title=title, source_pdf=source_pdf))
+    return found
 
 
 def spec_split_dir(estimate_folder: Path, pdf: Path) -> Path:

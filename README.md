@@ -6,9 +6,9 @@ This is the same upload path the USIS PDF app uses: the website stores the catal
 
 Multi-page **drawing** PDFs are split on this PC into one PDF per sheet before native B2 upload. Sheet number, title, discipline, set, and revision are read from that sheet's title block (and, for a file that is already one sheet, from the filename and folder, such as `A1-001_BCK-1.pdf` under `Architectural/Permit-Set/`). Package and form tokens (`PKG1`, `ADD01`, `NO.4`, `W9`) are not sheet numbers. If the name is missing or does not look like a real sheet id, the sheet **still uploads** and a review item is posted to `POST /api/v1/ingest/errors` so it appears in the CM ingest tracker when someone opens the app.
 
-Only real drawing PDFs are sheet-split. Specs, specifications, project manuals, addenda, bid forms, W-9s, RFP/RFQ, manuals, and combined bid sets stay the original multi-page PDF and go to the documents API only. A name or path like `Pali CHS_JAN 2025_Specs` or `Pali_CHS_JAN_2025_Specs` is a spec book even when it sits in a Drawings folder. A date token such as `JAN 2025` is not a sheet number. They are not sheet-split and they do not get drawing rows. A single sheet whose filename is a real sheet id, such as `A-101 Wall Specifications`, is still a drawing.
+Only real drawing PDFs are sheet-split. Specs stay multipage: sheet-split never opens a spec book. Addenda, bid forms, W-9s, RFP/RFQ, manuals that are not specs, and combined bid sets also stay whole and go to Documents. A name or path like `Pali CHS_JAN 2025_Specs` or `Pali_CHS_JAN_2025_Specs` is a spec book even when it sits in a Drawings folder. A date token such as `JAN 2025` is not a sheet number. They do not get drawing rows. A single sheet whose filename is a real sheet id, such as `A-101 Wall Specifications`, is still a drawing.
 
-When an estimate folder already exists, a Specs PDF on that document path is also handed to Charles's Spec_Parser CLI. CSI section PDFs are written under `<estimate>\02_Processed\spec_splits\<file stem>\`. Those files are documents on disk. They are not drawing sheets, they are not posted to the Drawings API, and they are not uploaded through Render. The original manual is still uploaded as one document. See [Spec section PDFs](#spec-section-pdfs-spec_parser).
+When an estimate folder already exists, a file classified as Specs is handed to Charles's Spec_Parser CLI with `--by section`. Each CSI section PDF (still multipage) is written under `<estimate>\02_Processed\spec_splits\<file stem>\` and uploaded to the CM Specs table by the same native B2 path drawings use. Section PDFs are not Drawings and are not generic Documents. PDF bytes do not go through Render. If Spec_Parser is missing, or the Specs native B2 mint is not deployed yet, the whole manual stays one specification document. See [Spec section PDFs](#spec-section-pdfs-spec_parser).
 
 GC offices do **not** share one package layout. A Turner progress-print zip, a numbered Swinerton folder tree, and a flat Webcor dump are all valid. The importer never requires a project-name pattern, `Progress Print` suffix, or revision scheme. It scores each file as:
 
@@ -167,9 +167,19 @@ The working directory is the Spec_Parser folder. The interpreter is the ingest p
 <outdir>\<pdf-stem>\split_report.json
 ```
 
-That is a documents folder. It is not `02_Processed\drawings`. Section PDFs are not uploaded to Drawings and are not sent through Render. Phase A leaves them on the estimate folder. The original Specs PDF is still stored as a document the same way it is today.
+That folder is not `02_Processed\drawings`. After the local write, each `{number} - {title}.pdf` is uploaded to the CM **Specs** table (`spec_sections`), not Drawings and not generic Documents. The request is JSON plus a native B2 upload and ack, the same pattern as drawings. `_unassigned\` files and `split_report.json` stay on disk only.
 
-If Spec_Parser is missing, or a manual fails to parse, ingest logs the reason and keeps the whole Specs PDF as a document. The rest of the batch still uploads.
+CM_Deploy today can create spec-section rows and can attach a PDF only with multipart `POST /api/v1/projects/{id}/rfi-lookups/spec_sections/{id}/file`. That route sends the PDF through Render, so ingest does not call it. There is no native B2 mint for Specs yet. This client calls the same shape as drawings and documents:
+
+- Microsoft session: `POST /api/v1/jobs/{jobId}/spec-sections` (JSON only)
+- Ingest key: `POST /api/spec-sections` (JSON only)
+- Mint: `POST /api/v1/spec-sections/{id}/upload-session` or `POST /api/spec-sections/{id}/b2-upload-url`
+- Native `b2_upload_file` from this PC
+- Ack: `POST /api/v1/spec-sections/{id}/ack-file` or `POST /api/spec-sections/{id}/ack-file`
+
+Until CM_Deploy adds that mint, a 404, 405, or 501 is a soft gap: section PDFs stay in the estimate folder, those sections are not posted to Drawings or Documents, and the whole manual is still uploaded as one specification document.
+
+If Spec_Parser is missing, or a manual fails to parse, ingest logs the reason and keeps the whole Specs PDF as a specification document. The rest of the batch still uploads. When every section from a manual does upload to Specs, that manual is not also posted as a document.
 
 Manuals larger than about 800 pages or 150 MB are cut into roughly 300-page chunks, parsed, and merged into that same section folder.
 
