@@ -5,7 +5,14 @@ on the documents path as a spec. Section PDFs are written under the estimate
 folder (``02_Processed\\spec_splits\\<stem>``). They are documents on disk.
 They are never sheet-split and never sent to the Drawings API.
 
-The CLI is Charles's existing tool. This module does not reimplement parsing.
+This is USISCM_Injest on the data server, not the legacy ``C:\\usis-cm`` agent
+and not the desktop USISPdfApp CSI splitter (``CsiSectionParser`` /
+``POST /api/v1/ai/spec-sections``).
+
+The CLI is Charles's existing Python tool. This module does not reimplement
+parsing. Spec_Parser has no GitHub repo. At ops time, copy the full tree onto
+WIN-C7 at ``D:\\Programs\\Spec_Parser``. Do not substitute a partial clone
+such as ``spec_cli.py`` / ``spec_split.py`` (those omit detect/csi/toc/gui).
 
 Default install: ``D:\\Programs\\Spec_Parser`` (override with ``SPEC_PARSER_DIR``
 or ``USISCM_SPEC_PARSER_DIR``).
@@ -13,7 +20,15 @@ or ``USISCM_SPEC_PARSER_DIR``).
     python cli.py <Specifications.pdf> -o <outdir> --by section
 
 Working directory is the Spec_Parser directory. ``gui.py`` is never used.
+The tool also accepts ``--by division``; this ingest path does not.
 
+Spec_Parser writes, under ``-o``:
+
+    <out>/<pdf-stem>/Div NN - <name>/{number} - {title}.pdf
+    <out>/<pdf-stem>/_unassigned/
+    <out>/<pdf-stem>/split_report.json
+
+``-o`` here is ``02_Processed\\spec_splits\\<stem>``, matching BidDocProcessor.
 A missing install or a parse error is logged and ignored. The whole Specs PDF
 stays a document and the rest of ingest continues.
 """
@@ -42,6 +57,7 @@ _SPEC_CHUNK_PAGES = 800
 _SPEC_CHUNK_MB = 150
 _SPEC_CHUNK_SIZE = 300  # pages per chunk
 
+# Full Spec_Parser install only. spec_cli.py / spec_split.py are a partial clone.
 _CLI_NAMES = ("cli.py", "main.py", "run.py", "app.py")
 
 _NON_MANUAL_RE = re.compile(

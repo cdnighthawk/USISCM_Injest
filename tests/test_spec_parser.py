@@ -91,6 +91,8 @@ def test_gui_py_is_not_an_entrypoint(tmp_path: Path, monkeypatch: pytest.MonkeyP
     parser = tmp_path / "Spec_Parser"
     parser.mkdir()
     (parser / "gui.py").write_text("raise SystemExit('no gui')\n", encoding="utf-8")
+    (parser / "spec_cli.py").write_text("# partial clone\n", encoding="utf-8")
+    (parser / "spec_split.py").write_text("# partial clone\n", encoding="utf-8")
     monkeypatch.setenv("SPEC_PARSER_DIR", str(parser))
     assert _find_spec_parser_cli() is None
     (parser / "cli.py").write_text("# cli\n", encoding="utf-8")
@@ -216,6 +218,8 @@ def test_mocked_cli_invoke_uses_section_contract(tmp_path: Path, monkeypatch: py
         "--by",
         "section",
     ]
+    assert "--by" in cmd and cmd[cmd.index("--by") + 1] == "section"
+    assert "division" not in cmd
     assert captured["cwd"] == str(parser)
     assert (out / "09 29 00 - Gypsum Board.pdf").is_file()
     assert "gui.py" not in " ".join(str(part) for part in cmd)

@@ -141,23 +141,27 @@ If `Y:\Estimates\26092` does not exist, the sheet copy and the spec section spli
 
 ## Spec section PDFs (Spec_Parser)
 
-Project manuals and other Specs stay one document. They are not sheet-split onto the CM Drawings page. After that classification, ingest runs the existing Spec_Parser CLI and writes one PDF per CSI section.
+Project manuals and other Specs stay one document. They are not sheet-split onto the CM Drawings page. After that classification, ingest runs Charles's Python Spec_Parser CLI. This is USISCM_Injest, not the legacy `C:\usis-cm` agent, and not the desktop USISPdfApp CSI splitter.
 
-Install path on the data server (same folder BidDocProcessor uses):
+Spec_Parser is local-only. It has no GitHub repo. At ops time, copy the full program tree onto the data server:
 
 `D:\Programs\Spec_Parser`
 
-Override that directory with `SPEC_PARSER_DIR`. `USISCM_SPEC_PARSER_DIR` is accepted when `SPEC_PARSER_DIR` is unset. The entry point is `cli.py` (`main.py`, `run.py`, and `app.py` are fallbacks). `gui.py` is never started.
+That is the same folder BidDocProcessor uses on WIN-C7. Override it with `SPEC_PARSER_DIR`. `USISCM_SPEC_PARSER_DIR` is accepted when `SPEC_PARSER_DIR` is unset. The entry point is `cli.py` (`main.py`, `run.py`, and `app.py` are fallbacks). `gui.py` is never started. Do not point this at a partial copy such as `spec_cli.py` / `spec_split.py`; that tree is missing detect, csi, toc, and gui.
 
 ```text
 python cli.py <Specifications.pdf> -o <outdir> --by section
 ```
 
-The working directory is the Spec_Parser folder. The interpreter is the ingest process unless `SPEC_PARSER_PYTHON` points at the Python that has Spec_Parser's dependencies.
+The working directory is the Spec_Parser folder. The interpreter is the ingest process unless `SPEC_PARSER_PYTHON` points at the Python that has Spec_Parser's dependencies. The tool can also split with `--by division`. Ingest always passes `--by section`.
 
-Sections land here, and only here:
+`-o` is `<estimate folder>\02_Processed\spec_splits\<pdf stem>`. Spec_Parser then writes its own tree under that folder:
 
-`<estimate folder>\02_Processed\spec_splits\<pdf stem>\`
+```text
+<outdir>\<pdf-stem>\Div NN - <name>\{number} - {title}.pdf
+<outdir>\<pdf-stem>\_unassigned\
+<outdir>\<pdf-stem>\split_report.json
+```
 
 That is a documents folder. It is not `02_Processed\drawings`. Section PDFs are not uploaded to Drawings and are not sent through Render. Phase A leaves them on the estimate folder. The original Specs PDF is still stored as a document the same way it is today.
 
