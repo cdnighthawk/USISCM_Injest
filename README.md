@@ -8,6 +8,8 @@ Multi-page **drawing** PDFs are split on this PC into one PDF per sheet before n
 
 Only real drawing PDFs are sheet-split. Specs, specifications, project manuals, addenda, bid forms, W-9s, RFP/RFQ, manuals, and combined bid sets stay the original multi-page PDF and go to the documents API only. A name or path like `Pali CHS_JAN 2025_Specs` or `Pali_CHS_JAN_2025_Specs` is a spec book even when it sits in a Drawings folder. A date token such as `JAN 2025` is not a sheet number. They are not sheet-split and they do not get drawing rows. A single sheet whose filename is a real sheet id, such as `A-101 Wall Specifications`, is still a drawing.
 
+When an estimate folder already exists, a Specs PDF on that document path is also handed to Charles's Spec_Parser CLI. CSI section PDFs are written under `<estimate>\02_Processed\spec_splits\<file stem>\`. Those files are documents on disk. They are not drawing sheets, they are not posted to the Drawings API, and they are not uploaded through Render. The original manual is still uploaded as one document. See [Spec section PDFs](#spec-section-pdfs-spec_parser).
+
 GC offices do **not** share one package layout. A Turner progress-print zip, a numbered Swinerton folder tree, and a flat Webcor dump are all valid. The importer never requires a project-name pattern, `Progress Print` suffix, or revision scheme. It scores each file as:
 
 | Category | Typical signals (none required) |
@@ -98,7 +100,7 @@ Microsoft session:
 
 `split_pages` stays false in the ingest-key JSON. The split already happened here; the website must not split the file again, and file bytes still do not go through Render.
 
-If the job's estimate folder **already exists**, pass `--estimate-folder` (or a project `folder_path` / `estimate_folder` the website already returned). Each sheet is also copied to `<folder>\02_Processed\drawings`. A missing folder is skipped. This app does not create `Y:\Estimates` or any other estimate root.
+If the job's estimate folder **already exists**, pass `--estimate-folder` (or a project `folder_path` / `estimate_folder` the website already returned). Each sheet is also copied to `<folder>\02_Processed\drawings`. Spec manuals are split into CSI section PDFs under `<folder>\02_Processed\spec_splits\<stem>`. A missing folder is skipped. This app does not create `Y:\Estimates` or any other estimate root.
 
 Ingest API key (no Microsoft session):
 
@@ -135,7 +137,37 @@ To also drop the sheets into an estimate folder that is already on disk:
 usiscm-ingest watch --once --reprocess --package 26092 --estimate-folder "Y:\Estimates\26092"
 ```
 
-If `Y:\Estimates\26092` does not exist, the copy is skipped and nothing is created under `Y:\Estimates`.
+If `Y:\Estimates\26092` does not exist, the sheet copy and the spec section split are skipped and nothing is created under `Y:\Estimates`.
+
+## Spec section PDFs (Spec_Parser)
+
+Project manuals and other Specs stay one document. They are not sheet-split onto the CM Drawings page. After that classification, ingest runs the existing Spec_Parser CLI and writes one PDF per CSI section.
+
+Install path on the data server (same folder BidDocProcessor uses):
+
+`D:\Programs\Spec_Parser`
+
+Override that directory with `SPEC_PARSER_DIR`. `USISCM_SPEC_PARSER_DIR` is accepted when `SPEC_PARSER_DIR` is unset. The entry point is `cli.py` (`main.py`, `run.py`, and `app.py` are fallbacks). `gui.py` is never started.
+
+```text
+python cli.py <Specifications.pdf> -o <outdir> --by section
+```
+
+The working directory is the Spec_Parser folder. The interpreter is the ingest process unless `SPEC_PARSER_PYTHON` points at the Python that has Spec_Parser's dependencies.
+
+Sections land here, and only here:
+
+`<estimate folder>\02_Processed\spec_splits\<pdf stem>\`
+
+That is a documents folder. It is not `02_Processed\drawings`. Section PDFs are not uploaded to Drawings and are not sent through Render. Phase A leaves them on the estimate folder. The original Specs PDF is still stored as a document the same way it is today.
+
+If Spec_Parser is missing, or a manual fails to parse, ingest logs the reason and keeps the whole Specs PDF as a document. The rest of the batch still uploads.
+
+Manuals larger than about 800 pages or 150 MB are cut into roughly 300-page chunks, parsed, and merged into that same section folder.
+
+These names are not sent to Spec_Parser: notice inviting bid / NIB, invitation to bid, instructions to bidders, general or special provisions, door hardware, addendum letters, and files that are already one CSI section (`08 11 16 - Aluminum Doors.pdf`). A PDF that looks like a drawing set is not parsed.
+
+`--estimate-folder` on `watch` and `import` (including `--reprocess`) is enough. `watch` and `import` both go through the same upload step, so a project `folder_path` that already exists on disk is used the same way.
 
 A one-folder import (no watch state) does the same split:
 

@@ -4,7 +4,10 @@ Drawings and other documents follow the USISPdfApp path: catalog row on the
 website, file bytes straight to native B2, then a metadata-only ack.
 Render never receives the file. Multi-page drawing PDFs are split on this
 machine into one PDF per sheet before that upload. Specs, addenda, bid forms,
-W-9s, manuals, and combined bid sets stay on the documents path. Automatic
+W-9s, manuals, and combined bid sets stay on the documents path. Spec manuals
+are also sent to the Spec_Parser CLI when an estimate folder exists; CSI
+section PDFs are written under that folder and are not uploaded as drawings.
+Automatic
 drawing names never wait for a person; ambiguous names still upload and are
 logged on ``/api/v1/ingest/errors`` so they show up in the CM ingest tracker.
 A long run refreshes the Microsoft access token before it expires and retries
@@ -60,6 +63,7 @@ from usiscm_ingest.pdf_split import (
     expand_drawing_file,
     resolve_estimate_folder,
 )
+from usiscm_ingest.spec_parser import parse_spec_documents
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +134,7 @@ class UploadResult:
     details: list[dict[str, Any]] = field(default_factory=list)
     issues: list[dict[str, Any]] = field(default_factory=list)
     batch_id: str = ""
+    spec_splits: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -140,6 +145,7 @@ class UploadResult:
             "details": self.details,
             "issues": self.issues,
             "batch_id": self.batch_id,
+            "spec_splits": self.spec_splits,
         }
 
 
@@ -320,6 +326,16 @@ class UsiscmClient:
                 manifest, Path(tmp), result, report_failures=not dry_run
             )
             documents = self._document_items(manifest, result) + rerouted
+            # Specs are already documents. Section PDFs stay on disk under the
+            # estimate folder and are not added to ``drawings``.
+            if not dry_run:
+                try:
+                    result.spec_splits = parse_spec_documents(documents, estimate_dir)
+                except Exception as exc:
+                    logger.warning(
+                        "Spec_Parser step failed (%s); keeping spec PDFs as documents",
+                        exc,
+                    )
             if dry_run:
                 named = [_name_item(item).to_dict() for item in drawings]
                 result.details.append(

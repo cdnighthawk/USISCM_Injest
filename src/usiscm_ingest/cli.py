@@ -69,7 +69,8 @@ def main(argv: list[str] | None = None) -> int:
         "--estimate-folder",
         help=(
             "Existing CM estimate folder for this job. Split sheets are also copied to "
-            "folder\\02_Processed\\drawings. The folder must already exist; "
+            "folder\\02_Processed\\drawings. Spec manuals are split into CSI section "
+            "PDFs under folder\\02_Processed\\spec_splits. The folder must already exist; "
             "Y:\\Estimates roots are not created."
         ),
     )
@@ -106,7 +107,8 @@ def main(argv: list[str] | None = None) -> int:
         "--estimate-folder",
         help=(
             "Existing CM estimate folder. Split sheets are also copied to "
-            "folder\\02_Processed\\drawings. Must already exist."
+            "folder\\02_Processed\\drawings. Spec manuals are split into CSI section "
+            "PDFs under folder\\02_Processed\\spec_splits. Must already exist."
         ),
     )
 
