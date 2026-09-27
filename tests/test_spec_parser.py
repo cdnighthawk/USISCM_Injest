@@ -13,7 +13,7 @@ from usiscm_ingest.client import UsiscmClient
 from usiscm_ingest.config import Settings
 from usiscm_ingest.package import ingest_source
 from usiscm_ingest.spec_parser import (
-    DEFAULT_SPEC_PARSER_DIR,
+    SPEC_PARSER_CANDIDATES,
     _find_spec_parser_cli,
     _run_spec_parser,
     _should_spec_parse,
@@ -32,20 +32,47 @@ def _spec(path: Path) -> ClassifiedFile:
     )
 
 
-def test_default_spec_parser_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_candidate_order_is_c_then_d() -> None:
+    assert SPEC_PARSER_CANDIDATES == (
+        Path(r"C:\Programs\Spec_Parser"),
+        Path(r"D:\Programs\Spec_Parser"),
+    )
+
+
+def test_lookup_prefers_env_then_c_then_d(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    c_drive = tmp_path / "CPrograms"
+    d_drive = tmp_path / "DPrograms"
+    monkeypatch.setattr("usiscm_ingest.spec_parser.SPEC_PARSER_CANDIDATES", (c_drive, d_drive))
     monkeypatch.delenv("SPEC_PARSER_DIR", raising=False)
     monkeypatch.delenv("USISCM_SPEC_PARSER_DIR", raising=False)
-    assert spec_parser_dir() == DEFAULT_SPEC_PARSER_DIR
-    assert spec_parser_dir() == Path(r"D:\Programs\Spec_Parser")
+    assert spec_parser_dir() is None
+
+    d_drive.mkdir()
+    assert spec_parser_dir() == d_drive
+    c_drive.mkdir()
+    assert spec_parser_dir() == c_drive
+
+    monkeypatch.setenv("SPEC_PARSER_DIR", str(tmp_path / "from-spec"))
+    assert spec_parser_dir() == tmp_path / "from-spec"
+    monkeypatch.setenv("USISCM_SPEC_PARSER_DIR", str(tmp_path / "from-usiscm"))
+    assert spec_parser_dir() == tmp_path / "from-usiscm"
 
 
-def test_spec_parser_dir_env_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    other = tmp_path / "other"
-    monkeypatch.setenv("USISCM_SPEC_PARSER_DIR", str(other))
-    monkeypatch.setenv("SPEC_PARSER_DIR", str(tmp_path / "primary"))
-    assert spec_parser_dir() == tmp_path / "primary"
-    monkeypatch.delenv("SPEC_PARSER_DIR")
-    assert spec_parser_dir() == other
+def test_no_install_soft_fails_without_writing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    missing_c = tmp_path / "missing-c"
+    missing_d = tmp_path / "missing-d"
+    monkeypatch.setattr("usiscm_ingest.spec_parser.SPEC_PARSER_CANDIDATES", (missing_c, missing_d))
+    monkeypatch.delenv("SPEC_PARSER_DIR", raising=False)
+    monkeypatch.delenv("USISCM_SPEC_PARSER_DIR", raising=False)
+    pdf = tmp_path / "Project Manual.pdf"
+    pdf.write_bytes(b"%PDF")
+    out = tmp_path / "out"
+    result = _run_spec_parser(pdf, out)
+    assert result["ok"] is False
+    assert "not found" in result["error"]
+    assert str(missing_c) in result["error"]
+    assert str(missing_d) in result["error"]
+    assert not out.exists()
 
 
 def test_section_dir_is_under_spec_splits_not_drawings(tmp_path: Path) -> None:

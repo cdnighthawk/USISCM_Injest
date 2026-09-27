@@ -143,11 +143,15 @@ If `Y:\Estimates\26092` does not exist, the sheet copy and the spec section spli
 
 Project manuals and other Specs stay one document. They are not sheet-split onto the CM Drawings page. After that classification, ingest runs Charles's Python Spec_Parser CLI. This is USISCM_Injest, not the legacy `C:\usis-cm` agent, and not the desktop USISPdfApp CSI splitter.
 
-Spec_Parser is local-only. It has no GitHub repo. At ops time, copy the full program tree onto the data server:
+Spec_Parser is local-only. It has no GitHub repo. On WIN-C7 it is installed at `C:\Programs\Spec_Parser` (`cli.py` is there). `D:` on that machine is Windows install media and cannot host Programs. `D:\Programs\Spec_Parser` is only the HomeOffice / BidDocProcessor fallback.
 
-`D:\Programs\Spec_Parser`
+Lookup order when a manual is ready to split:
 
-That is the same folder BidDocProcessor uses on WIN-C7. Override it with `SPEC_PARSER_DIR`. `USISCM_SPEC_PARSER_DIR` is accepted when `SPEC_PARSER_DIR` is unset. The entry point is `cli.py` (`main.py`, `run.py`, and `app.py` are fallbacks). `gui.py` is never started. Do not point this at a partial copy such as `spec_cli.py` / `spec_split.py`; that tree is missing detect, csi, toc, and gui.
+1. `USISCM_SPEC_PARSER_DIR` if set, otherwise `SPEC_PARSER_DIR` if set
+2. `C:\Programs\Spec_Parser`
+3. `D:\Programs\Spec_Parser`
+
+If none of those exist, ingest logs that and keeps the whole Specs PDF as a document. The entry point is `cli.py` (`main.py`, `run.py`, and `app.py` are fallbacks). `gui.py` is never started. Do not point this at a partial copy such as `spec_cli.py` / `spec_split.py`; that tree is missing detect, csi, toc, and gui.
 
 ```text
 python cli.py <Specifications.pdf> -o <outdir> --by section

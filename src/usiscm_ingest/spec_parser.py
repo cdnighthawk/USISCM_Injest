@@ -10,12 +10,15 @@ and not the desktop USISPdfApp CSI splitter (``CsiSectionParser`` /
 ``POST /api/v1/ai/spec-sections``).
 
 The CLI is Charles's existing Python tool. This module does not reimplement
-parsing. Spec_Parser has no GitHub repo. At ops time, copy the full tree onto
-WIN-C7 at ``D:\\Programs\\Spec_Parser``. Do not substitute a partial clone
-such as ``spec_cli.py`` / ``spec_split.py`` (those omit detect/csi/toc/gui).
+parsing. Spec_Parser has no GitHub repo. On WIN-C7 the tree is at
+``C:\\Programs\\Spec_Parser`` (``D:`` is Windows install media and cannot host
+Programs). ``D:\\Programs\\Spec_Parser`` remains a fallback for HomeOffice /
+BidDocProcessor. Do not substitute a partial clone such as ``spec_cli.py`` /
+``spec_split.py`` (those omit detect/csi/toc/gui).
 
-Default install: ``D:\\Programs\\Spec_Parser`` (override with ``SPEC_PARSER_DIR``
-or ``USISCM_SPEC_PARSER_DIR``).
+Lookup: ``USISCM_SPEC_PARSER_DIR`` or ``SPEC_PARSER_DIR`` if set, then
+``C:\\Programs\\Spec_Parser``, then ``D:\\Programs\\Spec_Parser``. If none
+exist, parsing is skipped and the whole Specs PDF stays a document.
 
     python cli.py <Specifications.pdf> -o <outdir> --by section
 
@@ -49,7 +52,12 @@ from usiscm_ingest.classify import FileCategory
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SPEC_PARSER_DIR = Path(r"D:\Programs\Spec_Parser")
+# WIN-C7 install, then HomeOffice / BidDocProcessor compatibility. D: on WIN-C7
+# is Windows install media and cannot host Programs.
+SPEC_PARSER_CANDIDATES = (
+    Path(r"C:\Programs\Spec_Parser"),
+    Path(r"D:\Programs\Spec_Parser"),
+)
 PROCESSED_SPEC_SPLITS = Path("02_Processed") / "spec_splits"
 
 # Huge-spec chunking. Same thresholds BidDocProcessor uses.
@@ -73,13 +81,33 @@ _CSI_SECTION_RE = re.compile(r"^\d{2}[\s._-]*\d{2}[\s._-]*\d{2}\b")
 _CSI_FLAT_RE = re.compile(r"^\d{6}\b")
 
 
-def spec_parser_dir() -> Path:
-    """Install directory. ``SPEC_PARSER_DIR`` wins, then ``USISCM_SPEC_PARSER_DIR``."""
-    for name in ("SPEC_PARSER_DIR", "USISCM_SPEC_PARSER_DIR"):
+def spec_parser_dir() -> Path | None:
+    """Install directory, or None when no env override and neither default exists.
+
+    An env value is used even if that folder is missing, so a bad override
+    soft-fails instead of silently picking another drive. Otherwise the first
+    existing candidate wins: ``C:\\Programs\\Spec_Parser``, then
+    ``D:\\Programs\\Spec_Parser``.
+    """
+    for name in ("USISCM_SPEC_PARSER_DIR", "SPEC_PARSER_DIR"):
         raw = os.environ.get(name, "").strip().strip('"')
         if raw:
             return Path(raw).expanduser()
-    return DEFAULT_SPEC_PARSER_DIR
+    for candidate in SPEC_PARSER_CANDIDATES:
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _spec_parser_missing_message() -> str:
+    chosen = spec_parser_dir()
+    if chosen is not None:
+        return f"Spec_Parser not found at {chosen}"
+    tried = ", ".join(str(path) for path in SPEC_PARSER_CANDIDATES)
+    return (
+        "Spec_Parser not found. Set USISCM_SPEC_PARSER_DIR or SPEC_PARSER_DIR. "
+        f"Also looked for {tried}."
+    )
 
 
 def spec_parser_python() -> str:
@@ -268,7 +296,7 @@ def _chunk_pdf_pages(pdf: Path, chunk_dir: Path, chunk_pages: int = _SPEC_CHUNK_
 
 def _find_spec_parser_cli(parser_dir: Path | None = None) -> Path | None:
     root = parser_dir if parser_dir is not None else spec_parser_dir()
-    if not root.is_dir():
+    if root is None or not root.is_dir():
         return None
     for name in _CLI_NAMES:
         cand = root / name
@@ -289,6 +317,8 @@ def _run_spec_parser_once(
     """Invoke Spec_Parser on one PDF (a manual or one chunk of a manual)."""
     out.mkdir(parents=True, exist_ok=True)
     parser_dir = spec_parser_dir()
+    if parser_dir is None:
+        return {"pdf": str(pdf), "ok": False, "error": _spec_parser_missing_message(), "out": str(out)}
     cmd = [spec_parser_python(), str(cli), str(pdf), "-o", str(out), "--by", "section"]
     logger.info("Spec_Parser command: %s (cwd %s)", " ".join(cmd), parser_dir)
     try:
@@ -363,7 +393,7 @@ def _run_spec_parser(pdf: Path, out: Path, *, progress=None, pct: float = 0) -> 
         return {
             "pdf": str(pdf),
             "ok": False,
-            "error": f"Spec_Parser not found at {spec_parser_dir()}",
+            "error": _spec_parser_missing_message(),
         }
 
     try:
